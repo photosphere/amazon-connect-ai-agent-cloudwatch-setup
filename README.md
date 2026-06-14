@@ -164,3 +164,130 @@ filter session_name = "<SessionName>"
 
 - **能否投递到 S3 / Firehose？**
   可以。修改脚本第 5 步的 `destinationResourceArn` 为对应的 S3 桶或 Firehose 流 ARN，并配置相应的资源策略。
+
+---
+
+# 日志解析与可视化排查（setup-connect-ai-agent-logs-analysis.sh）
+
+本脚本从配置文件 `config.env` 指定的**两个 CloudWatch 日志组**实时拉取日志，按 **Contact ID 关联**成可视化时间线，生成静态 HTML 页面并**在本地预览**：
+
+1. **Amazon Connect AI Agent 日志**（会话编排 / LLM 调用 / trace / 转人工）
+2. **Bedrock AgentCore Gateway 应用日志**（MCP server / 工具调用 / 网关错误）
+
+把两路日志放在同一条时间线上，排查「AI 说要调用某工具 → 网关实际执行情况」这类跨系统问题时一眼可见。排查能力参考官方 Workshop：[Logging & Observability · CloudWatch](https://catalog.workshops.aws/amazon-connect-ai-agents/en-US/01-foundation/09-logging-observability/05-cloudwatch)。
+
+| 文件 | 说明 |
+|------|------|
+| [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 读配置 → 拉两路 CloudWatch 日志 → 关联构建 → 本地预览 |
+| [`config.env.example`](./config.env.example) | 配置模板（占位符）；复制为 `config.env` 后填入真实 ARN |
+| `config.env` | 你的实际配置（含账号/ARN，已在 `.gitignore` 中，不提交）|
+| `lib/parse-connect-ai-logs.py` | 归一化两路日志并按 Contact ID 关联成 `data.js` |
+| `lib/web/index.html`、`lib/web/app.js` | 排查页面（前端按 Contact ID 分组、解析事件、还原对话）|
+
+## 配置文件（config.env）
+
+仓库只提供模板 `config.env.example`，首次使用时复制一份并填入自己的日志组 ARN：
+
+```bash
+cp config.env.example config.env
+# 然后编辑 config.env，填入两个日志组 ARN(可带结尾的 :*)
+```
+
+`config.env` 内容形如：
+
+```bash
+# Amazon Connect AI Agent 的 CloudWatch 日志组 ARN
+CONNECT_AI_AGENT_LOG_ARN="arn:aws:logs:us-west-2:991727053196:log-group:/aws/connect/ai-agent-logs:*"
+
+# Bedrock AgentCore Gateway 的 CloudWatch 日志组 ARN
+BEDROCK_AGENTCORE_GATEWAY_LOG_ARN="arn:aws:logs:us-west-2:991727053196:log-group:/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/connect-repair-mcp-server-gw-4aosemuo03:*"
+```
+
+脚本会从 ARN 自动解析出 region 与日志组名，无需另填区域。
+
+> `config.env` 含 AWS 账号 ID 与日志组 ARN，已加入 `.gitignore` 不会被提交；请勿把它推送到代码仓库。
+
+## 用法
+
+```bash
+chmod +x setup-connect-ai-agent-logs-analysis.sh
+
+# 首次使用先准备配置文件
+cp config.env.example config.env   # 然后编辑 config.env 填入两个日志组 ARN
+
+# 读取 config.env，拉取最近 24 小时两路日志并启动本地预览(默认行为)
+./setup-connect-ai-agent-logs-analysis.sh
+# 浏览器打开 http://localhost:8080
+
+# 自定义时间范围 / 端口 / 配置文件
+./setup-connect-ai-agent-logs-analysis.sh --hours 6 --port 9000
+./setup-connect-ai-agent-logs-analysis.sh --config ./my.env
+
+# 只构建不预览
+./setup-connect-ai-agent-logs-analysis.sh --no-serve
+```
+
+### 参数
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--config <file>` | 配置文件路径 | `./config.env` |
+| `--hours <n>` | 拉取最近 n 小时日志 | `24` |
+| `--out-dir <dir>` | 站点构建输出目录 | `./dist` |
+| `--no-serve` | 只构建，不启动本地预览 | 默认会启动 |
+| `--port <n>` | 本地预览端口 | `8080` |
+
+> 若指定端口被占用，脚本会自动向后顺延探测一个空闲端口（最多 +20）并在该端口启动预览。
+
+> 需要 aws cli v2 且已配置凭证，执行身份需具备目标两个日志组的 `logs:FilterLogEvents` 权限。
+
+## 核心概念：Contact ID 与跨源关联
+
+- Connect 日志里的 **`session_name`**（也出现在 span 的 `session_name=...`）就是 Amazon Connect 的 **Contact ID**；**`session_id`** 是底层 Q in Connect 的内部会话 ID。
+- 页面以 **Contact ID 为主键**分组，并通过 `session_id → session_name` 映射，把只带 `session_id` 的事件（如 `TRANSCRIPT_UTTERANCE`）归并到正确的 Contact 下。
+- **Gateway 日志**按以下顺序关联到 Contact：
+  1. 消息文本里直接出现某个已知 `contactId` / `sessionId` → 关联到该会话；
+  2. 否则按时间落入某个 Contact 的活动时间窗（左右各放宽 5 秒）→ 关联到最接近的会话；
+  3. 都不满足 → 归入「未关联的 Gateway 日志」分组。
+
+## 页面能做什么
+
+- **左侧** 按 Contact ID 列表，支持搜索；徽标直观显示「工具调用 / 网关日志 / 转人工 / 错误 / 护栏拦截」，便于一眼定位异常会话。每个 Contact 右侧提供两个快捷操作：
+  - **⧉ 拷贝**：一键把该 Contact ID 复制到剪贴板（复制成功后图标短暂变为 ✓）。
+  - **⬇ 下载**：把该 Contact 对应的日志导出为 CSV 文件 `contact-<id>-logs.csv`，**同时包含 Amazon Connect AI Agent 与 Bedrock Gateway 两路日志**，按时间排序。列为 `timestamp_ms, datetime, source, event_type, message`（带 UTF-8 BOM，Excel 可直接打开）。
+- **右侧** 是该 Contact 的事件时间线，按时间排序，每个事件带 **Connect / Gateway 来源标签**，可按事件类型过滤：
+  - `UTTERANCE`：客户/机器人逐句话术
+  - `ORCHESTRATION_MESSAGE`：编排层对外消息（自动拆出 `<message>` 与 `<thinking>`）
+  - `AGENTIC_MESSAGE` / `LARGE_LANGUAGE_MODEL_INVOCATION`：还原送给模型的多轮对话、工具调用与工具返回
+  - `AI_AGENT_TRACE`：span 调用链（`invoke_agent` / `inference` / `execute_tool` / `escalate_agent`），含状态、耗时、Token 用量
+  - `CREATE_SESSION` / `SESSION_POLLED`：会话生命周期与坐席分配
+  - `GATEWAY`：Bedrock AgentCore Gateway 应用日志（JSON 或纯文本均兼容，自动标记 ERROR）
+- 每个事件都可展开查看**原始 JSON**，排查时既能看结构化视图也能看原文。
+
+## 构建流程
+
+```
+CONNECT_AI_AGENT_LOG_ARN ─┐
+                          ├─ aws logs filter-log-events(自动翻页)
+BEDROCK_..._GATEWAY_LOG_ARN ┘            │
+                                         ▼
+              parse-connect-ai-logs.py  → dist/data.js
+              (归一化 + 修复非法 JSON 转义 + 按 Contact ID 关联两路日志)
+                          │  + index.html + app.js
+                          ▼
+              本地静态站点 → python3 -m http.server → 浏览器排查页面
+```
+
+- 站点是**纯静态**，`data.js` 在构建时生成；日志更新后重新执行脚本即可刷新数据。
+- 拉取与构建在本地完成，不会把会话内容上传到任何外部服务。
+
+> 注意：`data.js` 中包含完整会话内容（可能含 PII）。请仅在受信任的本机环境查看，不要把 `dist/` 目录直接对外公开。
+
+## 常见问题
+
+- **页面空白 / 没有 Contact**：确认两个日志组在所选时间范围内确有日志；可加大 `--hours`。CloudWatch 只有在产生真实会话时才会投递。
+- **Gateway 日志都进了「未关联」分组**：说明网关日志里既没有出现 contactId/sessionId，时间上也没落入任一会话窗口。可确认两个日志组属于同一套环境、时钟一致，或加大时间范围。
+- **拉不到日志**：检查 `config.env` 里的 ARN、region 是否正确，以及当前身份是否有对应日志组的 `logs:FilterLogEvents` 权限。
+- **日志里有非法 JSON 导致解析失败？** 解析脚本会把模型多行输出产生的「反斜杠+换行」等非法转义自动修复，并重新序列化成合法 JSON 写入 `data.js`；Gateway 的纯文本日志则原样保留。
+- **拷贝按钮不生效？** 浏览器的剪贴板 API 仅在安全上下文（`localhost` 或 HTTPS）可用；本地预览用 `localhost` 即可。若仍不可用，脚本前端会自动回退到兼容方式，必要时弹出文本框供手动复制。
+- **下载的 CSV 里都有什么？** 该 Contact 名下的全部事件（Connect + Gateway），按时间排序，列为 `timestamp_ms, datetime, source, event_type, message`，`message` 为原始日志内容。文件带 UTF-8 BOM，Excel 可直接正确识别中文。
