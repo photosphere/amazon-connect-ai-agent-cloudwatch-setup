@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Connect AI Agent 日志排查 · CloudWatch</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a22;
+    --panel-2: #1e222c;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #4f9cff;
+    --green: #3fb950;
+    --red: #f85149;
+    --amber: #d29922;
+    --purple: #a371f7;
+    --cyan: #39c5cf;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 12px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  .layout { flex: 1; display: flex; min-height: 0; }
+  .sidebar {
+    width: 340px;
+    min-width: 280px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+  }
+  .search {
+    padding: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .search input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .search input::placeholder { color: var(--muted); }
+  .contact-list { overflow-y: auto; flex: 1; }
+  .contact-item {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .contact-item:hover { background: var(--panel-2); }
+  .contact-item.active { background: var(--panel-2); border-left: 3px solid var(--accent); padding-left: 9px; }
+  .cid-row { display: flex; align-items: flex-start; gap: 6px; }
+  .contact-item .cid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--accent); word-break: break-all; flex: 1; min-width: 0; }
+  .cid-actions { display: flex; gap: 2px; flex-shrink: 0; }
+  .icon-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 4px; cursor: pointer; font-size: 12px; line-height: 1;
+    padding: 3px 6px; transition: all 0.12s;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--accent); background: var(--panel); }
+  .icon-btn.ok { color: var(--green); border-color: var(--green); }
+  .contact-item .sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .badges { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge {
+    font-size: 10px; padding: 2px 6px; border-radius: 10px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.err { color: var(--red); border-color: var(--red); }
+  .badge.esc { color: var(--amber); border-color: var(--amber); }
+  .badge.ok { color: var(--green); border-color: var(--green); }
+  .badge.gw { color: var(--cyan); border-color: var(--cyan); }
+
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .toolbar {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .toolbar .title { font-family: ui-monospace, monospace; font-size: 13px; color: var(--accent); }
+  .filters { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  .filter-chip {
+    font-size: 11px; padding: 3px 9px; border-radius: 12px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); user-select: none;
+  }
+  .filter-chip.on { color: var(--text); border-color: var(--accent); }
+
+  .timeline { overflow-y: auto; flex: 1; padding: 14px 16px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 80px; font-size: 14px; }
+
+  .event {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 10px;
+    background: var(--panel);
+    overflow: hidden;
+  }
+  .event-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; cursor: pointer;
+  }
+  .event-head:hover { background: var(--panel-2); }
+  .ev-time { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .ev-type {
+    font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px;
+    background: var(--panel-2); white-space: nowrap;
+  }
+  .ev-summary { flex: 1; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev-tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); }
+  .ev-tag.err { color: var(--red); border-color: var(--red); }
+  .ev-tag.ok { color: var(--green); border-color: var(--green); }
+
+  .event-body { display: none; padding: 0 12px 12px; }
+  .event.open .event-body { display: block; }
+  .kv { font-size: 12px; color: var(--muted); margin: 2px 0; }
+  .kv b { color: var(--text); font-weight: 600; }
+  .bubble {
+    margin: 8px 0; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+  }
+  .bubble.customer { background: #14283d; border: 1px solid #1f4a73; }
+  .bubble.bot { background: #1c2a1c; border: 1px solid #2f4f2f; }
+  .bubble.thinking { background: #25202f; border: 1px solid #3a2f4f; color: var(--muted); font-style: italic; }
+  .toolcall { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: 8px 0; font-size: 12px; }
+  .toolcall .name { color: var(--purple); font-weight: 600; font-family: ui-monospace, monospace; }
+  pre.raw {
+    background: #0b0d12; border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; font-size: 11px; overflow-x: auto; color: #c9d1d9;
+    max-height: 360px; overflow-y: auto; margin: 8px 0 0;
+  }
+  .raw-toggle { font-size: 11px; color: var(--accent); cursor: pointer; user-select: none; }
+  details summary { cursor: pointer; font-size: 12px; color: var(--accent); margin-top: 6px; }
+
+  /* type color accents */
+  .t-UTTERANCE .ev-type { color: var(--cyan); }
+  .t-ORCHESTRATION_MESSAGE .ev-type { color: var(--green); }
+  .t-AGENTIC_MESSAGE .ev-type { color: var(--purple); }
+  .t-LARGE_LANGUAGE_MODEL_INVOCATION .ev-type { color: var(--purple); }
+  .t-AI_AGENT_TRACE .ev-type { color: var(--amber); }
+  .t-CREATE_SESSION .ev-type, .t-SESSION_POLLED .ev-type { color: var(--muted); }
+  .t-GATEWAY .ev-type { color: var(--cyan); }
+  .t-GATEWAY { border-left: 3px solid var(--cyan); }
+
+  /* 数据源标签 */
+  .src-tag { font-size: 9px; padding: 1px 5px; border-radius: 3px; white-space: nowrap; font-weight: 600; }
+  .src-connect { background: #14283d; color: #6cb6ff; border: 1px solid #1f4a73; }
+  .src-gateway { background: #0f2e30; color: var(--cyan); border: 1px solid #1f5a5e; }
+
+  .stat-row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .stat-row b { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Connect AI Agent 日志排查</h1>
+  <span class="meta" id="globalMeta">加载中…</span>
+</header>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="search">
+      <input id="searchBox" type="text" placeholder="按 Contact ID 搜索…" autocomplete="off" />
+    </div>
+    <div class="contact-list" id="contactList"></div>
+  </aside>
+  <section class="main">
+    <div class="toolbar">
+      <span class="title" id="selectedTitle">未选择会话</span>
+      <div class="filters" id="filters"></div>
+    </div>
+    <div class="timeline" id="timeline">
+      <div class="empty">从左侧选择一个 Contact ID 查看会话时间线</div>
+    </div>
+  </section>
+</div>
+
+<script src="./data.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
