@@ -28,8 +28,18 @@ set -euo pipefail
 # ----------------------------------------------------------------------------
 INSTANCE_ARN="${1:-}"
 
+# 未通过参数提供 ARN 时，提示用户手动输入 Amazon Connect 客户实例 ARN
 if [[ -z "${INSTANCE_ARN}" ]]; then
-  echo "错误: 缺少参数。" >&2
+  echo "请输入 Amazon Connect 客户实例 ARN" >&2
+  echo "（示例: arn:aws:connect:us-west-2:111122223333:instance/<instance-id>）:" >&2
+  read -r INSTANCE_ARN
+fi
+
+# 去除可能存在的首尾空白字符
+INSTANCE_ARN="$(echo "${INSTANCE_ARN}" | tr -d '[:space:]')"
+
+if [[ -z "${INSTANCE_ARN}" ]]; then
+  echo "错误: 未提供 Amazon Connect 客户实例 ARN。" >&2
   echo "用法: $0 <amazon-connect-instance-arn>" >&2
   exit 1
 fi
