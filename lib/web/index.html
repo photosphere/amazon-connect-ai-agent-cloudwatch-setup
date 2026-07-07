@@ -50,8 +50,7 @@
     flex-direction: column;
   }
   .search {
-    padding: 10px;
-    border-bottom: 1px solid var(--border);
+    padding: 10px 10px 8px;
   }
   .search input {
     width: 100%;
@@ -63,6 +62,24 @@
     font-size: 13px;
   }
   .search input::placeholder { color: var(--muted); }
+  .sort {
+    padding: 0 10px 10px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .sort label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .sort select {
+    flex: 1;
+    padding: 6px 8px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+  }
   .contact-list { overflow-y: auto; flex: 1; }
   .contact-item {
     padding: 10px 12px;
@@ -181,6 +198,15 @@
   <aside class="sidebar">
     <div class="search">
       <input id="searchBox" type="text" placeholder="按 Contact ID 搜索…" autocomplete="off" />
+    </div>
+    <div class="sort">
+      <label for="sortSelect">排序</label>
+      <select id="sortSelect">
+        <option value="time_desc">时间（最新优先）</option>
+        <option value="time_asc">时间（最早优先）</option>
+        <option value="count_desc">事件数（多 → 少）</option>
+        <option value="count_asc">事件数（少 → 多）</option>
+      </select>
     </div>
     <div class="contact-list" id="contactList"></div>
   </aside>
