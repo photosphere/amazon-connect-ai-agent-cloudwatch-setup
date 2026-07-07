@@ -5,6 +5,8 @@
 | 文件 | 说明 |
 |------|------|
 | [`setup-connect-ai-agent-logs.sh`](./setup-connect-ai-agent-logs.sh) | 一键配置脚本，幂等可重复执行 |
+| [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 拉取两路日志、按 Contact ID 关联并本地可视化排查（见文末章节）|
+| [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh) | 按日志组 ARN 下载全部日志并打包 zip（见文末章节）|
 
 > 配置原理参考官方文档：[Monitor Connect AI agents by using CloudWatch Logs](https://docs.aws.amazon.com/connect/latest/adminguide/monitor-ai-agents.html)
 
@@ -291,3 +293,78 @@ BEDROCK_..._GATEWAY_LOG_ARN ┘            │
 - **日志里有非法 JSON 导致解析失败？** 解析脚本会把模型多行输出产生的「反斜杠+换行」等非法转义自动修复，并重新序列化成合法 JSON 写入 `data.js`；Gateway 的纯文本日志则原样保留。
 - **拷贝按钮不生效？** 浏览器的剪贴板 API 仅在安全上下文（`localhost` 或 HTTPS）可用；本地预览用 `localhost` 即可。若仍不可用，脚本前端会自动回退到兼容方式，必要时弹出文本框供手动复制。
 - **下载的 CSV 里都有什么？** 该 Contact 名下的全部事件（Connect + Gateway），按时间排序，列为 `timestamp_ms, datetime, source, event_type, message`，`message` 为原始日志内容。文件带 UTF-8 BOM，Excel 可直接正确识别中文。
+
+---
+
+# 下载并打包 CloudWatch 日志（load-cloudwatch-logs.sh）
+
+当你只想把**某一个** CloudWatch 日志组的日志整体导出、离线归档或发给他人排查时，用这个脚本最省事：交互式（或用参数）传入一个日志组 ARN，脚本会自动翻页拉取该日志组下**所有日志流**的全部事件，并打包成一个 zip 文件。
+
+| 文件 | 说明 |
+|------|------|
+| [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh) | 按日志组 ARN 拉取全部日志 → 生成 JSON/文本 → 打包 zip |
+
+## 前置条件
+
+- **AWS CLI v2** 已安装并配置凭证，执行身份具备目标日志组的 `logs:FilterLogEvents` 权限。
+- 本机具备 `python3` 与 `zip` 命令。
+
+## 用法
+
+```bash
+chmod +x load-cloudwatch-logs.sh
+
+# 方式一：直接运行，按提示交互式粘贴日志组 ARN(拉取全部历史日志)
+./load-cloudwatch-logs.sh
+
+# 方式二：用参数直接指定 ARN
+./load-cloudwatch-logs.sh --arn "arn:aws:logs:us-west-2:991727053196:log-group:/aws/connect/ai-agent-logs:*"
+
+# 只拉取最近 24 小时，并指定 zip 输出路径
+./load-cloudwatch-logs.sh \
+  --arn "arn:aws:logs:us-west-2:991727053196:log-group:/aws/connect/ai-agent-logs:*" \
+  --hours 24 \
+  --zip ./my-logs.zip
+```
+
+ARN 可带结尾的 `:*`，脚本会自动从 ARN 解析出 region 与日志组名，无需另填区域。
+
+### 参数
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--arn <arn>` | CloudWatch 日志组 ARN；不提供时交互式提示输入 | 交互式输入 |
+| `--hours <n>` | 只拉取最近 n 小时日志；为 0 或不填则拉取全部历史 | `0`（全部历史）|
+| `--out-dir <dir>` | 日志文件输出目录 | 脚本所在目录 |
+| `--zip <file>` | 打包生成的 zip 路径 | `./cloudwatch-logs-<时间戳>.zip` |
+
+## 执行流程
+
+```
+输入: CloudWatch 日志组 ARN(参数或交互式)
+  │
+  ├─ 从 ARN 解析 region 与日志组名
+  │
+  ├─ 阶段一 预扫描: 先翻页数一遍, 得到总页数与总事件数
+  │
+  ├─ 阶段二 拉取: aws logs filter-log-events 自动翻页, 实时显示进度
+  │              (进度: 已完成页/总页, 已拉取条数/总条数, 百分比)
+  │
+  ├─ 写出两个文件:
+  │     events.json  完整结构化数据(logGroup/region/events)
+  │     events.log   按时间排序的可读文本(时间 \t 日志流名 \t 消息)
+  │
+  └─ 打包: 把上述两个文件压缩进 zip
+  │
+  ▼
+完成: 打印事件数量、日志文件路径与 zip 路径
+```
+
+- 默认日志文件直接生成在**脚本所在目录**（`events.json`、`events.log`），zip 里也只包含这两个文件。
+- 拉取分两个阶段：先预扫描算出总量，再带**实时进度**下载，方便判断大日志组的进度。
+
+## 常见问题
+
+- **未拉取到任何日志事件**：确认所选时间范围内确有日志（可去掉 `--hours` 拉取全部历史，或加大范围如 `--hours 720`）；核对 ARN 的日志组名与 region；确认当前身份具备 `logs:FilterLogEvents` 权限。
+- **预扫描为何要多请求一遍？** `filter-log-events` 无法直接返回总数，为了在下载前给出准确的总页数/总条数用于进度显示，脚本会先翻页统计一次，再正式拉取。日志量很大时这会使 API 调用翻倍。
+- **zip 里包含哪些内容？** 仅本次生成的 `events.json` 与 `events.log`，不会把目录里的其它文件一起打包。
