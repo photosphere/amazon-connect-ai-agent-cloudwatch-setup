@@ -27,6 +27,7 @@ parse-connect-ai-logs.py
 """
 import argparse
 import csv
+import datetime
 import json
 import re
 import sys
@@ -69,12 +70,54 @@ def sanitize_message(msg):
 # 读取: 自动识别 filter-log-events JSON / 控制台导出 CSV
 # ---------------------------------------------------------------------------
 def load_any(path, source):
-    """返回 [{timestamp, message, source}]，自动识别 JSON 或 CSV。"""
+    """返回 [{timestamp, message, source}]，自动识别 JSON / 制表符文本(.log) / CSV。"""
     with open(path, "r", encoding="utf-8") as f:
         head = f.read(1)
     if head == "{" or head == "[":
         return _load_events_json(path, source)
+    # 探测 load-cloudwatch-logs.sh 生成的 events.log:
+    #   "<datetime>\t<logStreamName>\t<message>"，制表符分隔且首列是时间戳
+    with open(path, "r", encoding="utf-8") as f:
+        first = f.readline()
+    if "\t" in first and _parse_dt_ms(first.split("\t", 1)[0]) is not None:
+        return _load_text_log(path, source)
     return _load_csv(path, source)
+
+
+def _parse_dt_ms(s):
+    """把可读时间字符串解析成 epoch 毫秒；无法解析返回 None。"""
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%fZ", "%Y-%m-%d %H:%M:%SZ",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt).replace(tzinfo=datetime.timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def _load_text_log(path, source):
+    """读取制表符分隔的 events.log；跨多行的 message 会被并回同一条记录。"""
+    rows = []
+    cur = None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            parts = line.split("\t", 2)
+            ms = _parse_dt_ms(parts[0]) if parts else None
+            if ms is not None and len(parts) == 3:
+                if cur is not None:
+                    rows.append(cur)
+                cur = {"timestamp": ms, "message": parts[2], "source": source}
+            elif cur is not None:
+                # 多行 message 的续行，拼回上一条
+                cur["message"] += "\n" + line
+        if cur is not None:
+            rows.append(cur)
+    for r in rows:
+        r["message"] = sanitize_message(r["message"])
+    return rows
 
 
 def _load_events_json(path, source):
