@@ -763,6 +763,29 @@ awscli cloudfront create-invalidation --distribution-id "${DIST_ID}" \
   --paths "/*" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
+# 6.4 等待 CloudFront 部署完成(状态 InProgress -> Deployed)
+# ---------------------------------------------------------------------------
+echo "==> 等待 CloudFront 分配部署完成(通常 3~10 分钟)…"
+CF_STATUS="Unknown"
+WAITED=0
+MAX_WAIT=1200   # 最长等待 20 分钟
+while [[ ${WAITED} -lt ${MAX_WAIT} ]]; do
+  CF_STATUS="$(awscli cloudfront get-distribution --id "${DIST_ID}" \
+    --query 'Distribution.Status' --output text 2>/dev/null || echo 'Unknown')"
+  if [[ "${CF_STATUS}" == "Deployed" ]]; then
+    printf "\r    CloudFront 状态: Deployed ✅ (耗时 %ds)                    \n" "${WAITED}"
+    break
+  fi
+  printf "\r    CloudFront 状态: %s … 已等待 %ds" "${CF_STATUS}" "${WAITED}"
+  sleep 15
+  WAITED=$((WAITED + 15))
+done
+if [[ "${CF_STATUS}" != "Deployed" ]]; then
+  printf "\n    CloudFront 仍在后台部署(状态: %s)。可稍后用以下命令查看:\n" "${CF_STATUS}"
+  echo "      aws cloudfront get-distribution --id ${DIST_ID} --query 'Distribution.Status' --output text"
+fi
+
+# ---------------------------------------------------------------------------
 # 7. 汇总
 # ---------------------------------------------------------------------------
 echo ""
@@ -770,6 +793,7 @@ echo "==================================================================="
 echo " 部署完成 🎉"
 echo "-------------------------------------------------------------------"
 echo " 访问地址(CloudFront):  https://${DIST_DOMAIN}"
+echo " CloudFront 部署状态:   $([[ "${CF_STATUS}" == "Deployed" ]] && echo '已完成 (Deployed)' || echo "${CF_STATUS}(后台继续部署中)")"
 echo " 登录邮箱:              ${EMAIL}"
 echo "   · 首次登录: 使用邮件里收到的一次性密码，登录后按提示设置新密码。"
 echo "   · 忘记密码: 登录页点击「忘记密码」，向该邮箱发送新的验证码后重置。"
@@ -777,6 +801,7 @@ echo ""
 echo " 资源清单:"
 echo "   CloudFront 访问地址: https://${DIST_DOMAIN}"
 echo "   CloudFront 分配 ID:  ${DIST_ID}"
+echo "   CloudFront 部署状态: ${CF_STATUS}"
 echo "   日志存储桶:          s3://${LOGS_BUCKET}  ($([[ "${CONTACT_COUNT}" == "?" ]] && echo 'Lambda 处理中' || echo "${CONTACT_COUNT} 个 Contact"))"
 echo "   原始数据(归档):      s3://${LOGS_BUCKET}/raw/"
 echo "   解析 Lambda:         ${LAMBDA_NAME}"
@@ -786,7 +811,11 @@ echo "   Cognito 应用客户端:  ${CLIENT_ID}"
 echo "   Cognito 身份池:      ${IDENTITY_POOL_ID}"
 echo "   鉴权角色:            ${AUTH_ROLE_ARN}"
 echo "-------------------------------------------------------------------"
-echo " 注意: CloudFront 分配首次部署通常需数分钟才能全球生效。"
+if [[ "${CF_STATUS}" == "Deployed" ]]; then
+  echo " 提示: CloudFront 已部署完成，可直接访问上面的地址。"
+else
+  echo " 提示: CloudFront 仍在后台部署，状态变为 Deployed 后即可访问。"
+fi
 echo "       原始日志与拆分均在云端完成(S3 事件触发 Lambda)，本地不处理任何日志文件。"
 echo "       重跑本脚本会重新拉取归档并触发 Lambda(已存在的 Contact 日志会跳过)。"
 echo "==================================================================="
