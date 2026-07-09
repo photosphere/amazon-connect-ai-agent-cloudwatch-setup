@@ -205,9 +205,9 @@ SITE_BUILD="${WORK}/site"
 mkdir -p "${LOGS_BUILD}" "${SITE_BUILD}"
 
 # ---------------------------------------------------------------------------
-# 1. 从 CloudWatch 拉取日志(自动翻页)
+# 1. 计算起始时间与通用辅助函数
 # ---------------------------------------------------------------------------
-# 计算起始时间(毫秒)；HOURS=0 表示全部历史(不设 start-time)
+# HOURS=0 表示全部历史(不设 start-time)
 START_MS=""
 if [[ "${HOURS}" != "0" ]]; then
   if date -u -d "@0" >/dev/null 2>&1; then
@@ -235,62 +235,9 @@ create_bucket() {
     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null
 }
 
-fetch_log_group() {
-  # $1=region $2=log-group $3=输出NDJSON路径 $4=start_ms(可空)
-  # 边翻页边写 NDJSON(每行一个事件)，并在控制台实时显示已拉取条数。
-  python3 - "$1" "$2" "$3" "$4" "${PROFILE}" <<'PYEOF'
-import json, subprocess, sys
-region, log_group, out, start_ms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-profile = sys.argv[5] if len(sys.argv) > 5 else ""
-next_token, count = None, 0
-with open(out, "w", encoding="utf-8") as f:
-    while True:
-        cmd = ["aws"]
-        if profile:
-            cmd += ["--profile", profile]
-        cmd += ["logs", "filter-log-events", "--region", region,
-                "--log-group-name", log_group, "--output", "json"]
-        if start_ms:
-            cmd += ["--start-time", start_ms]
-        if next_token:
-            cmd += ["--next-token", next_token]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as e:
-            sys.stderr.write((e.stderr or "filter-log-events 调用失败\n"))
-            sys.exit(1)
-        data = json.loads(res.stdout or "{}")
-        for ev in data.get("events", []):
-            ts, msg = ev.get("timestamp"), ev.get("message")
-            if ts is None or msg is None:
-                continue
-            f.write(json.dumps({"timestamp": ts, "message": msg}, ensure_ascii=False))
-            f.write("\n")
-            count += 1
-        sys.stderr.write("\r  拉取中… 已获取 %d 条" % count)
-        sys.stderr.flush()
-        next_token = data.get("nextToken")
-        if not next_token:
-            break
-sys.stderr.write("\r  拉取完成: %d 条 (%s)\n" % (count, log_group))
-PYEOF
-}
-
-CONNECT_NDJSON="${WORK}/_connect.ndjson"
-echo "==> 拉取 Connect AI Agent 日志 ..."
-fetch_log_group "${CONNECT_REGION}" "${CONNECT_LG}" "${CONNECT_NDJSON}" "${START_MS}"
-
-SPLIT_ARGS=(--connect "${CONNECT_NDJSON}" --out-dir "${LOGS_BUILD}")
-GATEWAY_NDJSON=""
-if [[ -n "${GATEWAY_ARN}" ]]; then
-  GATEWAY_NDJSON="${WORK}/_gateway.ndjson"
-  echo "==> 拉取 Bedrock AgentCore Gateway 日志 ..."
-  fetch_log_group "${GATEWAY_REGION}" "${GATEWAY_LG}" "${GATEWAY_NDJSON}" "${START_MS}"
-  SPLIT_ARGS+=(--gateway "${GATEWAY_NDJSON}")
-fi
-
 # ---------------------------------------------------------------------------
-# 2. 确保日志存储桶存在并配置 CORS(需在拆分之前，因为拆分会逐个 Contact 上传)
+# 2. 确保日志存储桶存在并配置 CORS
+#     (需在拉取/拆分之前：原始日志会流式归档到该桶，拆分也会逐个 Contact 上传)
 # ---------------------------------------------------------------------------
 if bucket_exists "${LOGS_BUCKET}"; then
   echo "==> 日志桶已存在，复用: ${LOGS_BUCKET}"
@@ -317,17 +264,28 @@ echo "==> 配置日志桶 CORS ..."
 awscli s3api put-bucket-cors --bucket "${LOGS_BUCKET}" --cors-configuration "file://${CORS_JSON}" >/dev/null
 
 # ---------------------------------------------------------------------------
-# 3. 按 Contact ID 拆分: 每解析完一个 Contact 立即上传其 .log，再处理下一个
-#     - 对 >100MB 的大日志会显示解析/上传进度
+# 3. 拉取 + 归档原始日志 + 按 Contact ID 拆分上传(全程不在本地磁盘落大文件)
+#     - 拉取时把原始 NDJSON 流式归档到 s3://<桶>/raw/{connect,gateway}.ndjson 长期保存
+#     - 每解析完一个 Contact 立即上传其 .log(上传后删除本地临时文件)
 #     - 上传前检查该 Contact 的 .log 是否已存在于桶中，已存在则跳过(幂等)
+#     - 对 >100MB 的大日志会显示拉取/上传进度
 # ---------------------------------------------------------------------------
-SPLIT_ARGS+=(--bucket "${LOGS_BUCKET}" --region "${REGION}" --prefix "")
+SPLIT_ARGS=(
+  --out-dir "${LOGS_BUILD}"
+  --connect-log-group "${CONNECT_LG}" --connect-region "${CONNECT_REGION}"
+  --bucket "${LOGS_BUCKET}" --region "${REGION}" --prefix "" --raw-prefix "raw/"
+)
+if [[ -n "${START_MS}" ]]; then
+  SPLIT_ARGS+=(--start-ms "${START_MS}")
+fi
+if [[ -n "${GATEWAY_ARN}" ]]; then
+  SPLIT_ARGS+=(--gateway-log-group "${GATEWAY_LG}" --gateway-region "${GATEWAY_REGION}")
+fi
 if [[ -n "${PROFILE}" ]]; then
   SPLIT_ARGS+=(--profile "${PROFILE}")
 fi
-echo "==> 按 Contact ID 解析并逐个上传到 s3://${LOGS_BUCKET}/ ..."
+echo "==> 拉取日志并按 Contact ID 拆分上传到 s3://${LOGS_BUCKET}/ ..."
 python3 "${SPLITTER}" "${SPLIT_ARGS[@]}"
-rm -f "${CONNECT_NDJSON}" "${GATEWAY_NDJSON}"
 
 CONTACT_COUNT="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('contactCount',0))" "${LOGS_BUILD}/index.json" 2>/dev/null || echo 0)"
 if [[ "${CONTACT_COUNT}" == "0" ]]; then
