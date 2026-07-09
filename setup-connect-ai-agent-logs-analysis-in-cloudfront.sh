@@ -6,11 +6,13 @@
 #   参考 setup-connect-ai-agent-logs-analysis.sh，但不再本地预览，而是把
 #   日志排查 Web 应用部署到 Amazon CloudFront，并用 Amazon Cognito 做登录鉴权。
 #
-#   流程概览:
-#     1) 拉取 CONNECT_AI_AGENT_LOG_ARN (必选) 与 BEDROCK_AGENTCORE_GATEWAY_LOG_ARN
-#        (可选) 两个日志组的全部日志;
-#     2) 按 Contact ID 拆分，为每个 contact 生成 "<contactId>.log" 文件，
-#        连同 index.json 清单上传到 S3 存储桶 "ai-agent-logs<suffix>"(不存在则自动创建);
+#   流程概览(全程不在本地处理任何日志文件):
+#     1) 创建日志桶 "ai-agent-logs<suffix>"(不存在则自动创建)，并为其配置 S3 事件通知,
+#        关联一个 Lambda 函数负责在云端解析原始日志;
+#     2) 把 CONNECT_AI_AGENT_LOG_ARN (必选) 与 BEDROCK_AGENTCORE_GATEWAY_LOG_ARN (可选)
+#        的全部日志以 NDJSON 流式"直传"到日志桶的 raw/ 前缀(原始数据长期保存),
+#        随后写入触发对象; S3 事件触发 Lambda 按 Contact ID 拆分, 生成
+#        "<contactId>.log" 与 index.json 写回同一个桶;
 #     3) 把 Web 应用发布到独立的 S3 桶并经 CloudFront(OAC) 对外提供;
 #        登录成功的用户经 Cognito Identity Pool 换取临时凭证，直接从
 #        "ai-agent-logs<suffix>" 桶加载全部日志渲染页面;
@@ -32,8 +34,8 @@
 #   --region <r>         部署区域; 默认取自 connect-arn
 #   --hours <n>          仅拉取最近 n 小时; 0 或不填=全部历史     [默认 0]
 #   --profile <p>        AWS CLI profile
-#   --out-dir <dir>      本地构建目录; 默认 ./dist-cloudfront
-#   --keep               保留本地构建目录(默认结束后保留)
+#   --out-dir <dir>      放临时部署产物的目录; 默认系统临时目录(/tmp)
+#   --keep               保留临时产物目录(默认结束后自动清理)
 #   -h, --help           显示帮助
 #
 # 依赖: aws cli v2(已配置凭证)、python3。
@@ -44,7 +46,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/lib"
 WEB_DIR="${LIB_DIR}/web"
 WEB_CF_DIR="${LIB_DIR}/web-cloudfront"
-SPLITTER="${LIB_DIR}/split-contacts.py"
+FETCHER="${LIB_DIR}/fetch-to-s3.py"
+LAMBDA_HANDLER="${LIB_DIR}/lambda/handler.py"
+PARSER_MODULE="${LIB_DIR}/parse-connect-ai-logs.py"
 
 # ---------------------------------------------------------------------------
 # 默认值
@@ -56,15 +60,15 @@ SUFFIX=""
 REGION=""
 HOURS="0"
 PROFILE=""
-OUT_DIR="${SCRIPT_DIR}/dist-cloudfront"
-KEEP="true"
+OUT_DIR=""
+KEEP="false"
 
 # CloudFront 托管缓存策略 CachingOptimized 的固定 ID
 CF_CACHE_POLICY_ID="658327ea-f89d-4fab-a63d-7e88639e58f6"
 # 浏览器版 AWS SDK v2
 AWS_SDK_URL="https://sdk.amazonaws.com/js/aws-sdk-2.1691.0.min.js"
 
-usage() { sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # 解析参数
@@ -99,7 +103,9 @@ awscli() {
 # ---------------------------------------------------------------------------
 command -v aws >/dev/null 2>&1 || { echo "错误: 未找到 aws CLI(需 v2 且已配置凭证)。" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "错误: 未找到 python3。" >&2; exit 1; }
-[[ -f "${SPLITTER}" ]] || { echo "错误: 找不到拆分脚本 ${SPLITTER}" >&2; exit 1; }
+[[ -f "${FETCHER}" ]] || { echo "错误: 找不到拉取脚本 ${FETCHER}" >&2; exit 1; }
+[[ -f "${LAMBDA_HANDLER}" ]] || { echo "错误: 找不到 Lambda 代码 ${LAMBDA_HANDLER}" >&2; exit 1; }
+[[ -f "${PARSER_MODULE}" ]] || { echo "错误: 找不到解析模块 ${PARSER_MODULE}" >&2; exit 1; }
 [[ -f "${WEB_CF_DIR}/auth.js" ]] || { echo "错误: 找不到 ${WEB_CF_DIR}/auth.js" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
@@ -170,6 +176,8 @@ WEB_BUCKET="ai-agent-logs${SUFFIX}-web"
 USER_POOL_NAME="connect-ai-agent-logs${SUFFIX}"
 IDENTITY_POOL_NAME="connect_ai_agent_logs${SUFFIX//-/_}"
 AUTH_ROLE_NAME="connect-ai-logs${SUFFIX}-auth-role"
+LAMBDA_NAME="connect-ai-logs${SUFFIX}-splitter"
+LAMBDA_ROLE_NAME="connect-ai-logs${SUFFIX}-lambda-role"
 
 # 校验桶名(S3 命名规则: 3-63 位小写字母/数字/连字符，首尾为字母数字)
 validate_bucket() {
@@ -199,10 +207,17 @@ echo "   登录邮箱          : ${EMAIL}"
 echo "   拉取范围          : $([[ "${HOURS}" == "0" ]] && echo '全部历史' || echo "最近 ${HOURS} 小时")"
 echo "==================================================================="
 
-WORK="${OUT_DIR}"
-LOGS_BUILD="${WORK}/logs-build"
-SITE_BUILD="${WORK}/site"
-mkdir -p "${LOGS_BUILD}" "${SITE_BUILD}"
+# 临时产物目录: 只存放很小的部署制品(IAM/桶策略等 JSON 与 Lambda 部署包)。
+# 默认放到系统临时目录(/tmp)，避免受限的 $HOME 磁盘配额(如 CloudShell)被占满。
+# 原始日志与拆分结果全部在云端处理，本地不落任何日志文件。
+if [[ -z "${OUT_DIR}" ]]; then
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/connect-ai-cf.XXXXXX")"
+else
+  WORK="${OUT_DIR}"
+  mkdir -p "${WORK}"
+fi
+cleanup() { [[ "${KEEP}" == "true" ]] || rm -rf "${WORK}" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # 1. 计算起始时间与通用辅助函数
@@ -264,34 +279,182 @@ echo "==> 配置日志桶 CORS ..."
 awscli s3api put-bucket-cors --bucket "${LOGS_BUCKET}" --cors-configuration "file://${CORS_JSON}" >/dev/null
 
 # ---------------------------------------------------------------------------
-# 3. 拉取 + 归档原始日志 + 按 Contact ID 拆分上传(全程不在本地磁盘落大文件)
-#     - 拉取时把原始 NDJSON 流式归档到 s3://<桶>/raw/{connect,gateway}.ndjson 长期保存
-#     - 每解析完一个 Contact 立即上传其 .log(上传后删除本地临时文件)
-#     - 上传前检查该 Contact 的 .log 是否已存在于桶中，已存在则跳过(幂等)
-#     - 对 >100MB 的大日志会显示拉取/上传进度
+# 2b. 解析用 Lambda: 执行角色 + 部署包 + 函数 + S3 触发权限 + 桶事件通知
+#     由 "trigger/*.json" 的 S3 事件触发，在云端读取 raw/ 原始日志并按 Contact 拆分。
 # ---------------------------------------------------------------------------
-SPLIT_ARGS=(
-  --out-dir "${LOGS_BUILD}"
-  --connect-log-group "${CONNECT_LG}" --connect-region "${CONNECT_REGION}"
-  --bucket "${LOGS_BUCKET}" --region "${REGION}" --prefix "" --raw-prefix "raw/"
-)
-if [[ -n "${START_MS}" ]]; then
-  SPLIT_ARGS+=(--start-ms "${START_MS}")
-fi
-if [[ -n "${GATEWAY_ARN}" ]]; then
-  SPLIT_ARGS+=(--gateway-log-group "${GATEWAY_LG}" --gateway-region "${GATEWAY_REGION}")
-fi
-if [[ -n "${PROFILE}" ]]; then
-  SPLIT_ARGS+=(--profile "${PROFILE}")
-fi
-echo "==> 拉取日志并按 Contact ID 拆分上传到 s3://${LOGS_BUCKET}/ ..."
-python3 "${SPLITTER}" "${SPLIT_ARGS[@]}"
+# Lambda 执行角色信任策略
+LAMBDA_TRUST_JSON="${WORK}/_lambda_trust.json"
+cat > "${LAMBDA_TRUST_JSON}" <<'JSON'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" },
+      "Action": "sts:AssumeRole" }
+  ]
+}
+JSON
 
-CONTACT_COUNT="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('contactCount',0))" "${LOGS_BUILD}/index.json" 2>/dev/null || echo 0)"
-if [[ "${CONTACT_COUNT}" == "0" ]]; then
+# Lambda 权限: 读写日志桶 + 写自身日志
+LAMBDA_POLICY_JSON="${WORK}/_lambda_policy.json"
+cat > "${LAMBDA_POLICY_JSON}" <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${LOGS_BUCKET}", "arn:aws:s3:::${LOGS_BUCKET}/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:*:*:*"
+    }
+  ]
+}
+JSON
+
+if awscli iam get-role --role-name "${LAMBDA_ROLE_NAME}" >/dev/null 2>&1; then
+  echo "==> 复用 Lambda 执行角色: ${LAMBDA_ROLE_NAME}"
+  awscli iam update-assume-role-policy --role-name "${LAMBDA_ROLE_NAME}" \
+    --policy-document "file://${LAMBDA_TRUST_JSON}" >/dev/null
+  LAMBDA_ROLE_ARN="$(awscli iam get-role --role-name "${LAMBDA_ROLE_NAME}" \
+    --query 'Role.Arn' --output text)"
+else
+  echo "==> 创建 Lambda 执行角色: ${LAMBDA_ROLE_NAME}"
+  LAMBDA_ROLE_ARN="$(awscli iam create-role --role-name "${LAMBDA_ROLE_NAME}" \
+    --assume-role-policy-document "file://${LAMBDA_TRUST_JSON}" \
+    --query 'Role.Arn' --output text)"
+fi
+awscli iam put-role-policy --role-name "${LAMBDA_ROLE_NAME}" \
+  --policy-name "logs-bucket-rw" \
+  --policy-document "file://${LAMBDA_POLICY_JSON}" >/dev/null
+
+# 打包 Lambda 部署包(handler.py + connect_parser.py)
+LAMBDA_ZIP="${WORK}/lambda.zip"
+python3 - "${LAMBDA_ZIP}" "${LAMBDA_HANDLER}" "${PARSER_MODULE}" <<'PYEOF'
+import sys, zipfile
+zp, handler, parser = sys.argv[1], sys.argv[2], sys.argv[3]
+with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+    z.write(handler, "handler.py")
+    z.write(parser, "connect_parser.py")
+PYEOF
+
+# IAM 角色最终一致性
+sleep 8
+
+if awscli lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "==> 更新 Lambda: ${LAMBDA_NAME}"
+  awscli lambda update-function-code --function-name "${LAMBDA_NAME}" --region "${REGION}" \
+    --zip-file "fileb://${LAMBDA_ZIP}" >/dev/null
+  awscli lambda wait function-updated --function-name "${LAMBDA_NAME}" --region "${REGION}" 2>/dev/null || sleep 5
+  awscli lambda update-function-configuration --function-name "${LAMBDA_NAME}" --region "${REGION}" \
+    --runtime python3.12 --role "${LAMBDA_ROLE_ARN}" --handler handler.handler \
+    --timeout 900 --memory-size 2048 >/dev/null
+else
+  echo "==> 创建 Lambda: ${LAMBDA_NAME}"
+  n=0
+  until awscli lambda create-function --function-name "${LAMBDA_NAME}" --region "${REGION}" \
+      --runtime python3.12 --role "${LAMBDA_ROLE_ARN}" --handler handler.handler \
+      --timeout 900 --memory-size 2048 --zip-file "fileb://${LAMBDA_ZIP}" >/dev/null 2>&1; do
+    n=$((n + 1))
+    if [[ ${n} -ge 6 ]]; then
+      echo "错误: 创建 Lambda 失败(执行角色可能尚未生效)。请稍后重跑本脚本。" >&2
+      exit 1
+    fi
+    echo "    等待执行角色生效，重试 (${n}/6) ..."
+    sleep 5
+  done
+fi
+LAMBDA_ARN="$(awscli lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}" \
+  --query 'Configuration.FunctionArn' --output text)"
+
+# 允许该日志桶调用此 Lambda(幂等: 先删同名声明)
+awscli lambda remove-permission --function-name "${LAMBDA_NAME}" --region "${REGION}" \
+  --statement-id s3invoke >/dev/null 2>&1 || true
+awscli lambda add-permission --function-name "${LAMBDA_NAME}" --region "${REGION}" \
+  --statement-id s3invoke --action "lambda:InvokeFunction" \
+  --principal s3.amazonaws.com \
+  --source-arn "arn:aws:s3:::${LOGS_BUCKET}" \
+  --source-account "${ACCOUNT_ID}" >/dev/null
+
+# 配置桶事件通知: trigger/ 前缀且 .json 后缀 -> 触发 Lambda
+NOTIF_JSON="${WORK}/_notif.json"
+cat > "${NOTIF_JSON}" <<JSON
+{
+  "LambdaFunctionConfigurations": [
+    {
+      "Id": "process-raw-logs",
+      "LambdaFunctionArn": "${LAMBDA_ARN}",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            { "Name": "prefix", "Value": "trigger/" },
+            { "Name": "suffix", "Value": ".json" }
+          ]
+        }
+      }
+    }
+  ]
+}
+JSON
+echo "==> 配置日志桶事件通知 -> Lambda"
+awscli s3api put-bucket-notification-configuration --bucket "${LOGS_BUCKET}" \
+  --notification-configuration "file://${NOTIF_JSON}" >/dev/null
+
+# ---------------------------------------------------------------------------
+# 3. 拉取原始日志"直传"S3(本地不落文件) -> 写触发对象 -> Lambda 在云端拆分
+# ---------------------------------------------------------------------------
+build_fetch_args() {
+  # $1=region $2=log-group $3=key $4=label
+  FETCH_ARGS=(--region "$1" --log-group "$2" --bucket "${LOGS_BUCKET}"
+              --key "$3" --s3-region "${REGION}" --label "$4")
+  [[ -n "${START_MS}" ]] && FETCH_ARGS+=(--start-ms "${START_MS}")
+  [[ -n "${PROFILE}" ]] && FETCH_ARGS+=(--profile "${PROFILE}")
+}
+
+echo "==> 拉取 Connect AI Agent 日志并直传 s3://${LOGS_BUCKET}/raw/connect.ndjson ..."
+build_fetch_args "${CONNECT_REGION}" "${CONNECT_LG}" "raw/connect.ndjson" "Connect"
+python3 "${FETCHER}" "${FETCH_ARGS[@]}" >/dev/null
+
+GATEWAY_TRIG=""
+if [[ -n "${GATEWAY_ARN}" ]]; then
+  echo "==> 拉取 Gateway 日志并直传 s3://${LOGS_BUCKET}/raw/gateway.ndjson ..."
+  build_fetch_args "${GATEWAY_REGION}" "${GATEWAY_LG}" "raw/gateway.ndjson" "Gateway"
+  python3 "${FETCHER}" "${FETCH_ARGS[@]}" >/dev/null
+  GATEWAY_TRIG=',"gateway":"raw/gateway.ndjson"'
+fi
+
+# 删除旧 index.json，便于随后轮询判断本次 Lambda 是否已生成
+awscli s3 rm "s3://${LOGS_BUCKET}/index.json" >/dev/null 2>&1 || true
+
+# 写触发对象(原始数据已就位) -> 触发 Lambda
+TRIGGER_JSON="${WORK}/_trigger.json"
+printf '{"connect":"raw/connect.ndjson"%s,"prefix":""}\n' "${GATEWAY_TRIG}" > "${TRIGGER_JSON}"
+echo "==> 写入触发对象，S3 事件将触发 Lambda 在云端解析 ..."
+awscli s3 cp "${TRIGGER_JSON}" "s3://${LOGS_BUCKET}/trigger/process.json" \
+  --content-type application/json >/dev/null
+
+# 轮询等待 Lambda 生成 index.json(最多约 5 分钟)
+echo "==> 等待 Lambda 解析并生成 index.json ..."
+CONTACT_COUNT="?"
+for _ in $(seq 1 100); do
+  if awscli s3api head-object --bucket "${LOGS_BUCKET}" --key index.json >/dev/null 2>&1; then
+    CONTACT_COUNT="$(awscli s3 cp "s3://${LOGS_BUCKET}/index.json" - 2>/dev/null \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin).get("contactCount","?"))' 2>/dev/null || echo '?')"
+    break
+  fi
+  sleep 3
+done
+
+if [[ "${CONTACT_COUNT}" == "?" ]]; then
+  echo "    Lambda 仍在后台处理(或耗时较长)。index.json 生成后站点即可加载数据。"
+  echo "    可查看函数日志: aws logs tail /aws/lambda/${LAMBDA_NAME} --region ${REGION} --follow"
+elif [[ "${CONTACT_COUNT}" == "0" ]]; then
   echo ""
   echo "⚠️  提示: 未从日志中解析出任何 Contact，站点会是空的。"
-  echo "    可加大时间范围(去掉 --hours 或加大值)，或核对日志组 ARN/权限。"
+  echo "    可加大时间范围(--hours 更大或不加)，或核对日志组 ARN/权限。"
   echo ""
 fi
 
@@ -440,17 +603,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. 构建 Web 站点(登录门禁版)并上传到 Web 桶
+# 5. 发布 Web 站点(登录门禁版) -> Web 桶(全部直传，不落本地文件)
 # ---------------------------------------------------------------------------
-echo "==> 构建站点到: ${SITE_BUILD}"
-# 复用现有前端逻辑
-cp "${WEB_DIR}/app.js"        "${SITE_BUILD}/"
-cp "${WEB_DIR}/i18n.js"       "${SITE_BUILD}/"
-cp "${WEB_DIR}/site-config.js" "${SITE_BUILD}/"
-cp "${WEB_CF_DIR}/auth.js"    "${SITE_BUILD}/"
+if bucket_exists "${WEB_BUCKET}"; then
+  echo "==> Web 桶已存在，复用: ${WEB_BUCKET}"
+else
+  create_bucket "${WEB_BUCKET}"
+fi
 
-# 生成运行时配置 aws-config.js
-cat > "${SITE_BUILD}/aws-config.js" <<JSON
+echo "==> 发布站点到 s3://${WEB_BUCKET}/ ..."
+JS_CT="application/javascript; charset=utf-8"
+# 复用现有前端逻辑，直接从仓库拷贝到 S3
+awscli s3 cp "${WEB_DIR}/app.js"         "s3://${WEB_BUCKET}/app.js"         --content-type "${JS_CT}" >/dev/null
+awscli s3 cp "${WEB_DIR}/i18n.js"        "s3://${WEB_BUCKET}/i18n.js"        --content-type "${JS_CT}" >/dev/null
+awscli s3 cp "${WEB_DIR}/site-config.js" "s3://${WEB_BUCKET}/site-config.js" --content-type "${JS_CT}" >/dev/null
+awscli s3 cp "${WEB_CF_DIR}/auth.js"     "s3://${WEB_BUCKET}/auth.js"        --content-type "${JS_CT}" >/dev/null
+
+# 生成运行时配置 aws-config.js(从内存直传，不落本地文件)
+awscli s3 cp - "s3://${WEB_BUCKET}/aws-config.js" --content-type "${JS_CT}" >/dev/null <<JSCFG
 /* 由 setup-connect-ai-agent-logs-analysis-in-cloudfront.sh 自动生成，请勿手工编辑 */
 window.__AWS_CONFIG__ = {
   region: "${REGION}",
@@ -460,21 +630,17 @@ window.__AWS_CONFIG__ = {
   logsBucket: "${LOGS_BUCKET}",
   logsPrefix: ""
 };
-JSON
+JSCFG
 
-# 由 lib/web/index.html 生成登录门禁版 index.html:
-#   - 去掉静态的 data.js(数据改为登录后从 S3 加载)
+# 由 lib/web/index.html 生成登录门禁版 index.html 并直传:
+#   - 去掉静态 data.js(数据改为登录后从 S3 加载)
 #   - 用 SDK + aws-config.js + auth.js 取代静态 app.js(app.js 由 auth.js 动态加载)
-AWS_SDK_URL="${AWS_SDK_URL}" python3 - "${WEB_DIR}/index.html" "${SITE_BUILD}/index.html" <<'PYEOF'
+AWS_SDK_URL="${AWS_SDK_URL}" python3 - "${WEB_DIR}/index.html" <<'PYEOF' \
+  | awscli s3 cp - "s3://${WEB_BUCKET}/index.html" --content-type "text/html; charset=utf-8" >/dev/null
 import os, re, sys
-src, dst = sys.argv[1], sys.argv[2]
 sdk = os.environ["AWS_SDK_URL"]
-html = open(src, encoding="utf-8").read()
-
-# 移除静态 data.js
+html = open(sys.argv[1], encoding="utf-8").read()
 html = re.sub(r'[ \t]*<script src="\./data\.js"></script>\s*\n', "", html)
-
-# 用鉴权脚本链替换静态 app.js
 replacement = (
     '<script src="%s"></script>\n'
     '<script src="./aws-config.js"></script>\n'
@@ -483,19 +649,8 @@ replacement = (
 html, n = re.subn(r'[ \t]*<script src="\./app\.js"></script>\s*\n', replacement, html)
 if n == 0:
     sys.stderr.write("警告: 未在 index.html 找到 app.js 脚本标签，请检查模板。\n")
-
-open(dst, "w", encoding="utf-8").write(html)
+sys.stdout.write(html)
 PYEOF
-
-# Web 桶
-if bucket_exists "${WEB_BUCKET}"; then
-  echo "==> Web 桶已存在，复用: ${WEB_BUCKET}"
-else
-  create_bucket "${WEB_BUCKET}"
-fi
-
-echo "==> 上传站点到 s3://${WEB_BUCKET}/ ..."
-awscli s3 sync "${SITE_BUILD}/" "s3://${WEB_BUCKET}/" --delete >/dev/null
 
 # ---------------------------------------------------------------------------
 # 6. CloudFront: 源访问控制(OAC) + 分配 + 回源桶策略
@@ -622,7 +777,9 @@ echo ""
 echo " 资源清单:"
 echo "   CloudFront 访问地址: https://${DIST_DOMAIN}"
 echo "   CloudFront 分配 ID:  ${DIST_ID}"
-echo "   日志存储桶:          s3://${LOGS_BUCKET}  (${CONTACT_COUNT} 个 Contact)"
+echo "   日志存储桶:          s3://${LOGS_BUCKET}  ($([[ "${CONTACT_COUNT}" == "?" ]] && echo 'Lambda 处理中' || echo "${CONTACT_COUNT} 个 Contact"))"
+echo "   原始数据(归档):      s3://${LOGS_BUCKET}/raw/"
+echo "   解析 Lambda:         ${LAMBDA_NAME}"
 echo "   Web 存储桶:          s3://${WEB_BUCKET}"
 echo "   Cognito 用户池:      ${USER_POOL_ID}"
 echo "   Cognito 应用客户端:  ${CLIENT_ID}"
@@ -630,11 +787,8 @@ echo "   Cognito 身份池:      ${IDENTITY_POOL_ID}"
 echo "   鉴权角色:            ${AUTH_ROLE_ARN}"
 echo "-------------------------------------------------------------------"
 echo " 注意: CloudFront 分配首次部署通常需数分钟才能全球生效。"
-echo "       若更新了日志，重跑本脚本会重新拆分上传并使 CloudFront 缓存失效。"
+echo "       原始日志与拆分均在云端完成(S3 事件触发 Lambda)，本地不处理任何日志文件。"
+echo "       重跑本脚本会重新拉取归档并触发 Lambda(已存在的 Contact 日志会跳过)。"
 echo "==================================================================="
 
-if [[ "${KEEP}" != "true" ]]; then
-  rm -rf "${WORK}"
-else
-  echo " 本地构建目录已保留: ${WORK}"
-fi
+[[ "${KEEP}" == "true" ]] && echo " 临时产物目录已保留: ${WORK}"
