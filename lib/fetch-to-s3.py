@@ -17,6 +17,7 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
 
 
 def main():
@@ -50,25 +51,86 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8")
 
+    # 用后台线程持续排空上传进程的 stderr:
+    # 大文件上传耗时长，若我们在翻页期间一直不读 stderr，一旦 aws s3 cp 往
+    # stderr 写满约 64KB 的管道缓冲，它就会阻塞写、进而停止读取 stdin，与主线程
+    # 形成死锁。持续排空可彻底避免这个隐患，出错信息也保留下来供最后报错用。
+    stderr_buf = []
+
+    def _drain_stderr(pipe, buf):
+        try:
+            for line in pipe:
+                buf.append(line)
+        except Exception:  # noqa: BLE001
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr,
+                                     args=(proc.stderr, stderr_buf),
+                                     daemon=True)
+    stderr_thread.start()
+
     next_token, count = None, 0
+    # 超时/重试参数说明:
+    #   filter-log-events 拉取"全部历史"时(无 --limit)需要在服务端扫描整个
+    #   日志组，单次调用可能耗时数十秒甚至更久，期间连接可能长时间没有数据返回。
+    #   - CLI_READ_TIMEOUT 需足够大，避免把"慢但正常"的扫描误判为超时;
+    #   - HARD_TIMEOUT 是最后一道防线: 即便底层 SSL socket 读取彻底卡死
+    #     (在部分环境如 Python 3.14 + 捆绑版 aws CLI 下确有发生)，也会强制结束
+    #     子进程并重试，从而保证脚本不会永久停在"拉取日志"这一步。
+    CLI_CONNECT_TIMEOUT = "15"
+    CLI_READ_TIMEOUT = "180"
+    HARD_TIMEOUT = 300
+    MAX_ATTEMPTS = 4
+
     try:
         while True:
             cmd = aws_base() + [
                 "logs", "filter-log-events", "--region", args.region,
                 "--log-group-name", args.log_group, "--output", "json",
+                "--cli-connect-timeout", CLI_CONNECT_TIMEOUT,
+                "--cli-read-timeout", CLI_READ_TIMEOUT,
             ]
             if args.start_ms:
                 cmd += ["--start-time", args.start_ms]
             if next_token:
                 cmd += ["--next-token", next_token]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0:
+
+            # 慢扫描期间给出"仍在拉取"的心跳，避免看起来像卡死。
+            sys.stderr.write("\r  拉取 %s… 已获取 %d 条(正在查询下一页，请稍候)"
+                             % (label, count))
+            sys.stderr.flush()
+
+            # 拉取当前页；对超时/瞬时错误做有限次重试。
+            #   - stdin 显式指向 /dev/null: 否则子进程会继承本脚本的 stdin
+            #     (交互式 TTY 或来自管道的 fd)，在上述环境下可能导致 CLI
+            #     网络读取死锁挂起。
+            res = None
+            last_err = ""
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    res = subprocess.run(cmd, capture_output=True, text=True,
+                                         stdin=subprocess.DEVNULL,
+                                         timeout=HARD_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    last_err = ("单次拉取超过 %ds 仍无响应(第 %d 次)，"
+                                "重试中…" % (HARD_TIMEOUT, attempt))
+                    sys.stderr.write("\n  %s\n" % last_err)
+                    continue
+                if res.returncode == 0:
+                    break
+                last_err = (res.stderr or "").strip()
+                sys.stderr.write("\n  拉取出错(第 %d 次): %s；重试中…\n"
+                                 % (attempt, last_err))
+                res = None
+
+            if res is None or res.returncode != 0:
                 try:
                     proc.stdin.close()
                 except (BrokenPipeError, ValueError):
                     pass
                 proc.wait()
-                sys.stderr.write("\n错误: 拉取失败: %s\n" % (res.stderr or "").strip())
+                sys.stderr.write("\n错误: 拉取失败(已重试 %d 次): %s\n"
+                                 % (MAX_ATTEMPTS, last_err))
                 sys.exit(1)
             data = json.loads(res.stdout or "{}")
             for ev in data.get("events", []):
@@ -91,12 +153,9 @@ def main():
             pass
         rc = proc.wait()
 
+    stderr_thread.join(timeout=5)
     if rc != 0:
-        err = ""
-        try:
-            err = (proc.stderr.read() or "").strip()
-        except Exception:  # noqa: BLE001
-            pass
+        err = ("".join(stderr_buf)).strip()
         sys.stderr.write("\n错误: 归档到 s3://%s/%s 失败(退出码 %d) %s\n"
                          % (args.bucket, args.key, rc, err))
         sys.exit(1)
