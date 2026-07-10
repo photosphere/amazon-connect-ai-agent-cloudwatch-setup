@@ -24,7 +24,7 @@
 #   ./setup-connect-ai-agent-logs-analysis-in-cloudfront.sh \
 #       [--connect-arn <arn>] [--gateway-arn <arn>] [--email <addr>] \
 #       [--suffix <s>] [--region <r>] [--hours <n>] [--profile <p>] \
-#       [--out-dir <dir>] [--keep] [-h|--help]
+#       [--out-dir <dir>] [--keep] [--lambda-memory <MB>] [-h|--help]
 #
 # 参数(未提供的必选项会交互式询问):
 #   --connect-arn <arn>  Connect AI Agent 日志组 ARN            [必选]
@@ -36,6 +36,7 @@
 #   --profile <p>        AWS CLI profile
 #   --out-dir <dir>      放临时部署产物的目录; 默认系统临时目录(/tmp)
 #   --keep               保留临时产物目录(默认结束后自动清理)
+#   --lambda-memory <MB> 解析 Lambda 内存; 默认 3008; 日志量大时调大(如 8192/10240)
 #   -h, --help           显示帮助
 #
 # 依赖: aws cli v2(已配置凭证)、python3。
@@ -62,13 +63,16 @@ HOURS="0"
 PROFILE=""
 OUT_DIR=""
 KEEP="false"
+# 解析用 Lambda 的内存(MB)。内存同时决定分配到的 CPU，越大解析越快、越不易 OOM;
+# 日志量很大(如 >100MB)时可调大，例如 --lambda-memory 6144 / 8192 / 10240。
+LAMBDA_MEMORY="3008"
 
 # CloudFront 托管缓存策略 CachingOptimized 的固定 ID
 CF_CACHE_POLICY_ID="658327ea-f89d-4fab-a63d-7e88639e58f6"
 # 浏览器版 AWS SDK v2
 AWS_SDK_URL="https://sdk.amazonaws.com/js/aws-sdk-2.1691.0.min.js"
 
-usage() { sed -n '2,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # 解析参数
@@ -84,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --profile)     PROFILE="$2"; shift 2;;
     --out-dir)     OUT_DIR="$2"; shift 2;;
     --keep)        KEEP="true"; shift;;
+    --lambda-memory) LAMBDA_MEMORY="$2"; shift 2;;
     -h|--help)     usage; exit 0;;
     *) echo "未知参数: $1" >&2; usage; exit 1;;
   esac
@@ -203,6 +208,7 @@ echo "   Gateway 日志组    : (未提供)"
 fi
 echo "   日志存储桶        : ${LOGS_BUCKET}"
 echo "   Web 存储桶        : ${WEB_BUCKET}"
+echo "   解析 Lambda 内存  : ${LAMBDA_MEMORY} MB"
 echo "   登录邮箱          : ${EMAIL}"
 echo "   拉取范围          : $([[ "${HOURS}" == "0" ]] && echo '全部历史' || echo "最近 ${HOURS} 小时")"
 echo "==================================================================="
@@ -302,7 +308,7 @@ cat > "${LAMBDA_POLICY_JSON}" <<JSON
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
       "Resource": ["arn:aws:s3:::${LOGS_BUCKET}", "arn:aws:s3:::${LOGS_BUCKET}/*"]
     },
     {
@@ -350,13 +356,14 @@ if awscli lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGIO
   awscli lambda wait function-updated --function-name "${LAMBDA_NAME}" --region "${REGION}" 2>/dev/null || sleep 5
   awscli lambda update-function-configuration --function-name "${LAMBDA_NAME}" --region "${REGION}" \
     --runtime python3.12 --role "${LAMBDA_ROLE_ARN}" --handler handler.handler \
-    --timeout 900 --memory-size 2048 >/dev/null
+    --timeout 900 --memory-size "${LAMBDA_MEMORY}" >/dev/null
+  awscli lambda wait function-updated --function-name "${LAMBDA_NAME}" --region "${REGION}" 2>/dev/null || sleep 5
 else
   echo "==> 创建 Lambda: ${LAMBDA_NAME}"
   n=0
   until awscli lambda create-function --function-name "${LAMBDA_NAME}" --region "${REGION}" \
       --runtime python3.12 --role "${LAMBDA_ROLE_ARN}" --handler handler.handler \
-      --timeout 900 --memory-size 2048 --zip-file "fileb://${LAMBDA_ZIP}" >/dev/null 2>&1; do
+      --timeout 900 --memory-size "${LAMBDA_MEMORY}" --zip-file "fileb://${LAMBDA_ZIP}" >/dev/null 2>&1; do
     n=$((n + 1))
     if [[ ${n} -ge 6 ]]; then
       echo "错误: 创建 Lambda 失败(执行角色可能尚未生效)。请稍后重跑本脚本。" >&2
@@ -368,6 +375,12 @@ else
 fi
 LAMBDA_ARN="$(awscli lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}" \
   --query 'Configuration.FunctionArn' --output text)"
+
+# S3 触发是"异步调用": 失败(如 OOM/超时)默认会自动重试 2 次，每次都从头重跑
+# 整份解析(大日志下每次可能长达 15 分钟)，纯属浪费。这里把最大重试次数设为 0:
+# 失败就快速失败，由 index.json 的 error 字段(可捕获异常)或函数日志(OOM/超时)体现。
+awscli lambda put-function-event-invoke-config --function-name "${LAMBDA_NAME}" \
+  --region "${REGION}" --maximum-retry-attempts 0 >/dev/null 2>&1 || true
 
 # 允许该日志桶调用此 Lambda(幂等: 先删同名声明)
 awscli lambda remove-permission --function-name "${LAMBDA_NAME}" --region "${REGION}" \
@@ -412,6 +425,11 @@ build_fetch_args() {
               --key "$3" --s3-region "${REGION}" --label "$4")
   [[ -n "${START_MS}" ]] && FETCH_ARGS+=(--start-ms "${START_MS}")
   [[ -n "${PROFILE}" ]] && FETCH_ARGS+=(--profile "${PROFILE}")
+  # 必须显式 return 0:
+  # 否则当 START_MS 与 PROFILE 均为空时，函数最后一条 `[[ ... ]] && ...`
+  # 因条件为假而返回 1，在 `set -e` 下会让整个脚本在"拉取日志"这一步
+  # 静默退出(既不报错也不继续)。
+  return 0
 }
 
 echo "==> 拉取 Connect AI Agent 日志并直传 s3://${LOGS_BUCKET}/raw/connect.ndjson ..."
@@ -436,21 +454,34 @@ echo "==> 写入触发对象，S3 事件将触发 Lambda 在云端解析 ..."
 awscli s3 cp "${TRIGGER_JSON}" "s3://${LOGS_BUCKET}/trigger/process.json" \
   --content-type application/json >/dev/null
 
-# 轮询等待 Lambda 生成 index.json(最多约 5 分钟)
-echo "==> 等待 Lambda 解析并生成 index.json ..."
+# 轮询等待 Lambda 生成 index.json(最长约 16 分钟，覆盖 Lambda 15 分钟上限)
+echo "==> 等待 Lambda 解析并生成 index.json(最长约 16 分钟)..."
 CONTACT_COUNT="?"
-for _ in $(seq 1 100); do
+PARSE_ERROR=""
+for _ in $(seq 1 200); do
   if awscli s3api head-object --bucket "${LOGS_BUCKET}" --key index.json >/dev/null 2>&1; then
-    CONTACT_COUNT="$(awscli s3 cp "s3://${LOGS_BUCKET}/index.json" - 2>/dev/null \
+    IDX_JSON="$(awscli s3 cp "s3://${LOGS_BUCKET}/index.json" - 2>/dev/null || echo '')"
+    CONTACT_COUNT="$(printf '%s' "${IDX_JSON}" \
       | python3 -c 'import sys,json; print(json.load(sys.stdin).get("contactCount","?"))' 2>/dev/null || echo '?')"
+    PARSE_ERROR="$(printf '%s' "${IDX_JSON}" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null || echo '')"
     break
   fi
-  sleep 3
+  sleep 5
 done
 
-if [[ "${CONTACT_COUNT}" == "?" ]]; then
+if [[ -n "${PARSE_ERROR}" ]]; then
+  echo ""
+  echo "⚠️  Lambda 解析报错: ${PARSE_ERROR}"
+  echo "    站点将没有数据。请查看函数日志排查:"
+  echo "    aws logs tail /aws/lambda/${LAMBDA_NAME} --region ${REGION} --follow"
+  echo ""
+elif [[ "${CONTACT_COUNT}" == "?" ]]; then
   echo "    Lambda 仍在后台处理(或耗时较长)。index.json 生成后站点即可加载数据。"
-  echo "    可查看函数日志: aws logs tail /aws/lambda/${LAMBDA_NAME} --region ${REGION} --follow"
+  echo "    若长时间不出现，多半是日志量过大导致内存不足(OOM)或超过 15 分钟超时被中止，可:"
+  echo "      · 用更大的内存重跑:  --lambda-memory 8192  (或 10240)"
+  echo "      · 或缩小拉取范围:    --hours <n>"
+  echo "    查看函数日志: aws logs tail /aws/lambda/${LAMBDA_NAME} --region ${REGION} --follow"
 elif [[ "${CONTACT_COUNT}" == "0" ]]; then
   echo ""
   echo "⚠️  提示: 未从日志中解析出任何 Contact，站点会是空的。"
@@ -786,6 +817,34 @@ if [[ "${CF_STATUS}" != "Deployed" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 6.5 写资源清单文件(供 clear.sh 按清单删除本次部署创建/管理的全部资源)
+# ---------------------------------------------------------------------------
+# 每行格式: 类型|标识符;以 # 开头为注释。clear.sh 会按依赖顺序删除。
+# 文件名带 suffix + 时间戳(UTC，精确到秒): 每次运行都生成一个新清单、不覆盖历史，
+# 同一天多次运行也不会冲突。删除时用 clear.sh 指定具体某个清单文件即可。
+MANIFEST_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+MANIFEST_FILE="${SCRIPT_DIR}/aws-resources-${SUFFIX}-${MANIFEST_TS}.manifest"
+{
+  echo "# Amazon Connect AI Agent 日志分析 — AWS 资源清单"
+  echo "# 生成时间(UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "# suffix       : ${SUFFIX}"
+  echo "# 删除全部资源 : ./clear.sh \"${MANIFEST_FILE}\""
+  echo "# 每行: 类型|标识符"
+  echo "REGION|${REGION}"
+  echo "ACCOUNT|${ACCOUNT_ID}"
+  echo "CF_DISTRIBUTION|${DIST_ID}"
+  echo "CF_OAC|${OAC_ID}"
+  echo "LAMBDA|${LAMBDA_NAME}"
+  echo "S3_BUCKET|${WEB_BUCKET}"
+  echo "S3_BUCKET|${LOGS_BUCKET}"
+  echo "COGNITO_IDENTITY_POOL|${IDENTITY_POOL_ID}"
+  echo "COGNITO_USER_POOL|${USER_POOL_ID}"
+  echo "IAM_ROLE|${LAMBDA_ROLE_NAME}"
+  echo "IAM_ROLE|${AUTH_ROLE_NAME}"
+} > "${MANIFEST_FILE}"
+echo "==> 已写入资源清单: ${MANIFEST_FILE}"
+
+# ---------------------------------------------------------------------------
 # 7. 汇总
 # ---------------------------------------------------------------------------
 echo ""
@@ -810,6 +869,7 @@ echo "   Cognito 用户池:      ${USER_POOL_ID}"
 echo "   Cognito 应用客户端:  ${CLIENT_ID}"
 echo "   Cognito 身份池:      ${IDENTITY_POOL_ID}"
 echo "   鉴权角色:            ${AUTH_ROLE_ARN}"
+echo "   资源清单文件:        ${MANIFEST_FILE}"
 echo "-------------------------------------------------------------------"
 if [[ "${CF_STATUS}" == "Deployed" ]]; then
   echo " 提示: CloudFront 已部署完成，可直接访问上面的地址。"
@@ -817,7 +877,15 @@ else
   echo " 提示: CloudFront 仍在后台部署，状态变为 Deployed 后即可访问。"
 fi
 echo "       原始日志与拆分均在云端完成(S3 事件触发 Lambda)，本地不处理任何日志文件。"
+echo "       删除本次部署的全部资源: ./clear.sh \"${MANIFEST_FILE}\""
 echo "       重跑本脚本会重新拉取归档并触发 Lambda(已存在的 Contact 日志会跳过)。"
 echo "==================================================================="
 
-[[ "${KEEP}" == "true" ]] && echo " 临时产物目录已保留: ${WORK}"
+if [[ "${KEEP}" == "true" ]]; then
+  echo " 临时产物目录已保留: ${WORK}"
+fi
+
+# 显式以 0 退出:
+# 避免最后一条命令(如上面的条件判断为假时)让脚本以非零码结束，
+# 从而使调用方误以为部署失败(实际已成功完成)。
+exit 0
