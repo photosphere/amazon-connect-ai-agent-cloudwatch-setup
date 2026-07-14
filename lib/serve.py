@@ -15,6 +15,7 @@ serve.py
 import argparse
 import json
 import os
+import subprocess
 import sys
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from functools import partial
@@ -29,6 +30,8 @@ class Handler(SimpleHTTPRequestHandler):
     default_lang = "中文"
     model_id = ""
     region = ""
+    connect_instance_id = ""   # DescribeContact 默认 instanceId
+    connect_region = ""        # DescribeContact 默认 region(缺省用 region)
 
     def _send_json(self, code, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -39,15 +42,56 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.rstrip("/") == "/api/config":
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/api/config":
             self._send_json(200, {
                 "available": self.translator is not None,
                 "lang": self.default_lang,
                 "model": self.model_id,
                 "region": self.region,
+                "describeContact": command_exists("aws"),
             })
             return
+        if path == "/api/describe-contact":
+            self._handle_describe_contact()
+            return
         return super().do_GET()
+
+    def _handle_describe_contact(self):
+        """实时调用 Amazon Connect DescribeContact 并返回其 JSON 结果。
+
+        入参(query string): contactId(必填), instanceId(可选, 缺省用启动参数)。
+        """
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        contact_id = (qs.get("contactId") or [""])[0].strip()
+        instance_id = (qs.get("instanceId") or [""])[0].strip() or self.connect_instance_id
+        region = (qs.get("region") or [""])[0].strip() or self.connect_region or self.region
+
+        if not command_exists("aws"):
+            self._send_json(503, {"error": "未找到 aws CLI，无法调用 DescribeContact。"})
+            return
+        if not contact_id:
+            self._send_json(400, {"error": "缺少 contactId。"})
+            return
+        if not instance_id:
+            self._send_json(400, {"error": "缺少 instanceId(未能从日志推断，请用 --connect-instance-id 指定)。"})
+            return
+
+        cmd = ["aws", "connect", "describe-contact",
+               "--instance-id", instance_id, "--contact-id", contact_id,
+               "--region", region, "--output", "json"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            self._send_json(502, {"error": (e.stderr or "describe-contact 调用失败").strip()[:500]})
+            return
+        try:
+            data = json.loads(res.stdout or "{}")
+        except ValueError:
+            self._send_json(502, {"error": "DescribeContact 返回的不是合法 JSON。"})
+            return
+        self._send_json(200, data)
 
     def do_POST(self):
         if self.path.rstrip("/") != "/api/translate":
@@ -109,11 +153,19 @@ def main():
     ap.add_argument("--top-p", type=float,
                     default=float(os.environ.get("NOVA_TRANSLATE_TOP_P", "0.9")),
                     help="核采样 top_p(0.0~1.0)")
+    ap.add_argument("--connect-instance-id",
+                    default=os.environ.get("CONNECT_INSTANCE_ID", ""),
+                    help="DescribeContact 默认使用的 Amazon Connect 实例 ID")
+    ap.add_argument("--connect-region",
+                    default=os.environ.get("CONNECT_REGION", ""),
+                    help="DescribeContact 调用的 region(缺省用 --region)")
     args = ap.parse_args()
 
     Handler.default_lang = args.lang or "中文"
     Handler.model_id = args.model
     Handler.region = args.region
+    Handler.connect_instance_id = args.connect_instance_id
+    Handler.connect_region = args.connect_region
     try:
         Handler.translator = BedrockTranslator(
             args.region, args.model,
