@@ -107,6 +107,14 @@ echo "==> 准备站点构建目录: ${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
 cp "${WEB_DIR}/index.html" "${OUT_DIR}/"
 cp "${WEB_DIR}/app.js" "${OUT_DIR}/"
+cp "${WEB_DIR}/i18n.js" "${OUT_DIR}/"
+cp "${WEB_DIR}/site-config.js" "${OUT_DIR}/"
+# 可选的 Amazon Connect 补充数据; 不存在则生成空桩, 避免页面 404
+if [[ -f "${WEB_DIR}/connect-enrich.js" ]]; then
+  cp "${WEB_DIR}/connect-enrich.js" "${OUT_DIR}/"
+elif [[ ! -f "${OUT_DIR}/connect-enrich.js" ]]; then
+  echo "window.__CONNECT_CONTACT_ENRICH__ = {};" > "${OUT_DIR}/connect-enrich.js"
+fi
 
 if [[ -n "${LOG_FILE}" ]]; then
   # =========================================================================
@@ -308,13 +316,23 @@ if [[ "${SERVE}" == "true" ]]; then
 
   echo ""
   echo "==> 启动本地预览服务器: http://localhost:${TRY_PORT}"
+  echo "    (通过 lib/serve.py 提供静态站点 + /api 接口: 按需翻译、DescribeContact 实时查询)"
   echo "    按 Ctrl+C 退出。"
-  cd "${OUT_DIR}"
-  exec python3 -m http.server "${TRY_PORT}"
+  SERVE_PY="${LIB_DIR}/serve.py"
+  if [[ -f "${SERVE_PY}" ]]; then
+    # serve.py 会在缺少 aws CLI / 凭证时自动降级(隐藏对应功能)，可安全启动
+    exec python3 "${SERVE_PY}" --dir "${OUT_DIR}" --port "${TRY_PORT}"
+  else
+    # 兜底: 纯静态预览(无 /api 接口，翻译与 DescribeContact 实时查询不可用)
+    cd "${OUT_DIR}"
+    exec python3 -m http.server "${TRY_PORT}"
+  fi
 else
   echo ""
   echo "==================================================================="
-  echo "构建完成！本地预览方式:"
+  echo "构建完成！本地预览方式(推荐, 含 /api 接口: 翻译 + DescribeContact 实时查询):"
+  echo "  python3 \"${LIB_DIR}/serve.py\" --dir \"${OUT_DIR}\" --port ${PORT}"
+  echo "或纯静态预览(无 /api 接口):"
   echo "  cd \"${OUT_DIR}\" && python3 -m http.server ${PORT}"
   echo "  然后浏览器访问 http://localhost:${PORT}"
   echo "==================================================================="

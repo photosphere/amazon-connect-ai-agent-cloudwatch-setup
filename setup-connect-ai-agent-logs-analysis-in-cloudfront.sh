@@ -22,13 +22,17 @@
 #
 # 用法:
 #   ./setup-connect-ai-agent-logs-analysis-in-cloudfront.sh \
-#       [--connect-arn <arn>] [--gateway-arn <arn>] [--email <addr>] \
-#       [--suffix <s>] [--region <r>] [--hours <n>] [--profile <p>] \
+#       [--connect-arn <arn>] [--gateway-arn <arn>] [--connect-instance-arn <arn>] \
+#       [--email <addr>] [--suffix <s>] [--region <r>] [--hours <n>] [--profile <p>] \
 #       [--out-dir <dir>] [--keep] [--lambda-memory <MB>] [-h|--help]
 #
 # 参数(未提供的必选项会交互式询问):
 #   --connect-arn <arn>  Connect AI Agent 日志组 ARN            [必选]
 #   --gateway-arn <arn>  Bedrock AgentCore Gateway 日志组 ARN    [可选]
+#   --connect-instance-arn <arn>  Amazon Connect 实例 ARN       [必选]
+#                        形如 arn:aws:connect:<region>:<account>:instance/<id>
+#                        用于登录用户在浏览器里调用 Connect API(DescribeContact:
+#                        点击 Contact ID 查看详情，以及派生"接电话的 DID / 挂断方")
 #   --email <addr>       登录用户邮箱(接收一次性密码)             [必选]
 #   --suffix <s>         桶名后缀; 日志桶为 ai-agent-logs<suffix> [必选]
 #   --region <r>         部署区域; 默认取自 connect-arn
@@ -56,6 +60,7 @@ PARSER_MODULE="${LIB_DIR}/parse-connect-ai-logs.py"
 # ---------------------------------------------------------------------------
 CONNECT_ARN=""
 GATEWAY_ARN=""
+CONNECT_INSTANCE_ARN=""
 EMAIL=""
 SUFFIX=""
 REGION=""
@@ -81,6 +86,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --connect-arn) CONNECT_ARN="$2"; shift 2;;
     --gateway-arn) GATEWAY_ARN="$2"; shift 2;;
+    --connect-instance-arn) CONNECT_INSTANCE_ARN="$2"; shift 2;;
     --email)       EMAIL="$2"; shift 2;;
     --suffix)      SUFFIX="$2"; shift 2;;
     --region)      REGION="$2"; shift 2;;
@@ -131,6 +137,24 @@ if [[ -z "${GATEWAY_ARN}" ]]; then
   read -r GATEWAY_ARN
 fi
 GATEWAY_ARN="$(echo "${GATEWAY_ARN}" | tr -d '[:space:]')"
+
+if [[ -z "${CONNECT_INSTANCE_ARN}" ]]; then
+  echo "请输入 Amazon Connect 实例 ARN(必选):"
+  echo "  例如: arn:aws:connect:us-west-2:111122223333:instance/2ff5674e-de94-4714-bc6d-d7f2cebeee9d"
+  echo "  用于登录用户在浏览器里调用 Connect API(DescribeContact 等)。"
+  printf "CONNECT_INSTANCE_ARN: "
+  read -r CONNECT_INSTANCE_ARN
+fi
+CONNECT_INSTANCE_ARN="$(echo "${CONNECT_INSTANCE_ARN}" | tr -d '[:space:]')"
+[[ -n "${CONNECT_INSTANCE_ARN}" ]] || { echo "错误: 必须提供 CONNECT_INSTANCE_ARN。" >&2; exit 1; }
+# 校验并解析 Connect 实例 ARN: arn:aws:connect:<region>:<account>:instance/<id>
+if [[ ! "${CONNECT_INSTANCE_ARN}" =~ ^arn:aws:connect:[a-z0-9-]+:[0-9]+:instance/[0-9a-fA-F-]+$ ]]; then
+  echo "错误: Connect 实例 ARN 格式不正确: ${CONNECT_INSTANCE_ARN}" >&2
+  echo "      期望形如 arn:aws:connect:<region>:<account>:instance/<instanceId>" >&2
+  exit 1
+fi
+CONNECT_INSTANCE_REGION="$(echo "${CONNECT_INSTANCE_ARN}" | cut -d: -f4)"
+CONNECT_INSTANCE_ID="${CONNECT_INSTANCE_ARN##*/}"
 
 if [[ -z "${EMAIL}" ]]; then
   echo "请输入登录用户邮箱(将接收一次性密码，必选):"
@@ -206,6 +230,7 @@ echo "   Gateway 日志组    : ${GATEWAY_LG} (${GATEWAY_REGION})"
 else
 echo "   Gateway 日志组    : (未提供)"
 fi
+echo "   Connect 实例      : ${CONNECT_INSTANCE_ID} (${CONNECT_INSTANCE_REGION})"
 echo "   日志存储桶        : ${LOGS_BUCKET}"
 echo "   Web 存储桶        : ${WEB_BUCKET}"
 echo "   解析 Lambda 内存  : ${LAMBDA_MEMORY} MB"
@@ -595,6 +620,25 @@ cat > "${S3_POLICY_JSON}" <<JSON
 }
 JSON
 
+# 登录用户在浏览器里调用 Amazon Connect API 的权限(DescribeContact / GetContactAttributes)。
+# 仅限所提供实例及其 contact 资源。
+CONNECT_POLICY_JSON="${WORK}/_connectpolicy.json"
+cat > "${CONNECT_POLICY_JSON}" <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["connect:DescribeContact", "connect:GetContactAttributes"],
+      "Resource": [
+        "${CONNECT_INSTANCE_ARN}",
+        "${CONNECT_INSTANCE_ARN}/contact/*"
+      ]
+    }
+  ]
+}
+JSON
+
 if awscli iam get-role --role-name "${AUTH_ROLE_NAME}" >/dev/null 2>&1; then
   echo "==> 复用鉴权角色: ${AUTH_ROLE_NAME}"
   awscli iam update-assume-role-policy --role-name "${AUTH_ROLE_NAME}" \
@@ -610,6 +654,9 @@ fi
 awscli iam put-role-policy --role-name "${AUTH_ROLE_NAME}" \
   --policy-name "read-logs-bucket" \
   --policy-document "file://${S3_POLICY_JSON}" >/dev/null
+awscli iam put-role-policy --role-name "${AUTH_ROLE_NAME}" \
+  --policy-name "connect-describe-contact" \
+  --policy-document "file://${CONNECT_POLICY_JSON}" >/dev/null
 
 # 等待角色可被身份池引用(IAM 最终一致性)
 sleep 8
@@ -650,6 +697,14 @@ awscli s3 cp "${WEB_DIR}/i18n.js"        "s3://${WEB_BUCKET}/i18n.js"        --c
 awscli s3 cp "${WEB_DIR}/site-config.js" "s3://${WEB_BUCKET}/site-config.js" --content-type "${JS_CT}" >/dev/null
 awscli s3 cp "${WEB_CF_DIR}/auth.js"     "s3://${WEB_BUCKET}/auth.js"        --content-type "${JS_CT}" >/dev/null
 
+# 可选: Amazon Connect API 补充数据(通话摘要/挂断方/CSAT 等); 无则上传空桩避免 404
+if [[ -f "${WEB_DIR}/connect-enrich.js" ]]; then
+  awscli s3 cp "${WEB_DIR}/connect-enrich.js" "s3://${WEB_BUCKET}/connect-enrich.js" --content-type "${JS_CT}" >/dev/null
+else
+  printf 'window.__CONNECT_CONTACT_ENRICH__ = {};\n' | \
+    awscli s3 cp - "s3://${WEB_BUCKET}/connect-enrich.js" --content-type "${JS_CT}" >/dev/null
+fi
+
 # 生成运行时配置 aws-config.js(从内存直传，不落本地文件)
 awscli s3 cp - "s3://${WEB_BUCKET}/aws-config.js" --content-type "${JS_CT}" >/dev/null <<JSCFG
 /* 由 setup-connect-ai-agent-logs-analysis-in-cloudfront.sh 自动生成，请勿手工编辑 */
@@ -659,7 +714,10 @@ window.__AWS_CONFIG__ = {
   clientId: "${CLIENT_ID}",
   identityPoolId: "${IDENTITY_POOL_ID}",
   logsBucket: "${LOGS_BUCKET}",
-  logsPrefix: ""
+  logsPrefix: "",
+  connectInstanceId: "${CONNECT_INSTANCE_ID}",
+  connectInstanceArn: "${CONNECT_INSTANCE_ARN}",
+  connectRegion: "${CONNECT_INSTANCE_REGION}"
 };
 JSCFG
 
