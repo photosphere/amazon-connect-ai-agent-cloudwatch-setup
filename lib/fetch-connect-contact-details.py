@@ -17,8 +17,12 @@ fetch-connect-contact-details.py
   }
 
 数据来源(均通过 aws CLI, 需已配置凭证且有相应权限):
-  - aws connect describe-contact        -> DisconnectReason / SystemEndpoint(DID) / 摘要(若开启)
-  - aws connect get-contact-attributes  -> 联系人属性(surveyResult / BU / 摘要等自定义键)
+  - aws connect describe-contact        -> DisconnectReason / SystemEndpoint(DID) / Attributes / 摘要(若开启)
+  - aws connect get-contact-attributes  -> 联系人属性(CSAT / BU / 摘要等自定义键)
+
+CSAT(满意度评分)取自联系人属性里的某个自定义键, 键名不写死, 由配置决定:
+  优先级: --csat-attr 参数 > 环境变量 CSAT_ATTRIBUTE_KEY > config.env 里的 CSAT_ATTRIBUTE_KEY
+          > 默认值 "botevaluation"
 
 Contact ID 来源(二选一):
   --data-js FILE      从前端 data.js 里解析出所有 contactId(session_name)
@@ -37,9 +41,43 @@ Contact ID 来源(二选一):
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+
+# CSAT 联系人属性键名的默认值(可被配置覆盖, 见 resolve_csat_key)
+DEFAULT_CSAT_ATTRIBUTE_KEY = "botevaluation"
+
+
+def read_config_value(path, key):
+    """从简单的 KEY="value" 形式的 env 配置文件里读取某个键;取不到返回 None。"""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() != key:
+                    continue
+                v = v.strip().strip('"').strip("'")
+                return v or None
+    except OSError:
+        return None
+    return None
+
+
+def resolve_csat_key(cli_value, config_path):
+    """按优先级解析 CSAT 属性键名: CLI > 环境变量 > 配置文件 > 默认值。"""
+    return (
+        (cli_value or "").strip()
+        or (os.environ.get("CSAT_ATTRIBUTE_KEY") or "").strip()
+        or (read_config_value(config_path, "CSAT_ATTRIBUTE_KEY") or "").strip()
+        or DEFAULT_CSAT_ATTRIBUTE_KEY
+    )
 
 
 def aws_connect(subcommand, args, region):
@@ -113,8 +151,11 @@ def pick_did(contact):
     return ""
 
 
-def fetch_one(instance_id, region, contact_id):
-    """拉取单个 contact 的补充字段, 返回 dict(可能部分为空)。"""
+def fetch_one(instance_id, region, contact_id, csat_key):
+    """拉取单个 contact 的补充字段, 返回 dict(可能部分为空)。
+
+    csat_key: CSAT 满意度评分对应的联系人属性键名(来自配置, 不写死)。
+    """
     out = {}
     dc = aws_connect("describe-contact",
                      ["--instance-id", instance_id, "--contact-id", contact_id],
@@ -124,12 +165,22 @@ def fetch_one(instance_id, region, contact_id):
     ga = aws_connect("get-contact-attributes",
                      ["--instance-id", instance_id, "--initial-contact-id", contact_id],
                      region)
-    attrs = (ga or {}).get("Attributes", {}) if ga else {}
+    # 合并两处联系人属性: describe-contact 返回体里的 Attributes 作为兜底,
+    # get-contact-attributes 的结果优先(键相同时覆盖)。
+    dc_attrs = contact.get("Attributes", {})
+    if not isinstance(dc_attrs, dict):
+        dc_attrs = {}
+    ga_attrs = (ga or {}).get("Attributes", {}) if ga else {}
+    if not isinstance(ga_attrs, dict):
+        ga_attrs = {}
+    attrs = dict(dc_attrs)
+    attrs.update(ga_attrs)
 
     disconnect = contact.get("DisconnectReason") or attrs.get("disconnectReason") or ""
     summary = pick_summary(contact, attrs)
     did = pick_did(contact) or attrs.get("did", "")
-    survey = attrs.get("surveyResult", attrs.get("csat", ""))
+    # CSAT: 用配置的键名取值; 未取到时保持回退 csat 键以兼容旧数据。
+    survey = attrs.get(csat_key, attrs.get("csat", ""))
     ai_calls = attrs.get("aiAgentCalls", "")
 
     # 缓存完整 DescribeContact 结果, 供前端「Contact 详情」tab 离线/静态展示
@@ -160,7 +211,14 @@ def main():
     src.add_argument("--data-js", help="前端 data.js 路径(从中解析 contactId)")
     src.add_argument("--contact-ids", help="逗号分隔的 contactId 列表")
     ap.add_argument("--out", required=True, help="输出的 connect-enrich.js 路径")
+    ap.add_argument("--config", default=os.path.join(os.getcwd(), "config.env"),
+                    help="配置文件路径, 用于读取 CSAT_ATTRIBUTE_KEY 等(默认 ./config.env)")
+    ap.add_argument("--csat-attr", default="",
+                    help="CSAT 满意度评分对应的联系人属性键名; "
+                         "留空则回退环境变量/配置文件, 最终默认 " + DEFAULT_CSAT_ATTRIBUTE_KEY)
     args = ap.parse_args()
+
+    csat_key = resolve_csat_key(args.csat_attr, args.config)
 
     if args.contact_ids:
         contact_ids = [c.strip() for c in args.contact_ids.split(",") if c.strip()]
@@ -176,7 +234,7 @@ def main():
         # contactId 形如 UUID; 过滤掉前端兜底分组名(含中文/括号)
         if not re.match(r"^[A-Za-z0-9._-]+$", cid):
             continue
-        info = fetch_one(args.instance_id, args.region, cid)
+        info = fetch_one(args.instance_id, args.region, cid, csat_key)
         if info:
             enrich[cid] = info
             ok += 1
@@ -187,8 +245,8 @@ def main():
         f.write(json.dumps(enrich, ensure_ascii=False))
         f.write(";\n")
 
-    sys.stderr.write("已写入 %s: 共 %d 个 Contact, 成功补充 %d 个。\n"
-                     % (args.out, len(contact_ids), ok))
+    sys.stderr.write("已写入 %s: 共 %d 个 Contact, 成功补充 %d 个。(CSAT 键名=%s)\n"
+                     % (args.out, len(contact_ids), ok, csat_key))
 
 
 if __name__ == "__main__":
