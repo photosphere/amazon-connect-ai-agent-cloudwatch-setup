@@ -204,11 +204,41 @@ CONNECT_AI_AGENT_LOG_ARN="arn:aws:logs:us-west-2:991727053196:log-group:/aws/con
 
 # Bedrock AgentCore Gateway 的 CloudWatch 日志组 ARN
 BEDROCK_AGENTCORE_GATEWAY_LOG_ARN="arn:aws:logs:us-west-2:991727053196:log-group:/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/connect-repair-mcp-server-gw-4aosemuo03:*"
+
+# (可选) CSAT 满意度评分对应的 Amazon Connect 联系人属性键名
+# 不配置时默认取 botevaluation
+CSAT_ATTRIBUTE_KEY="botevaluation"
 ```
 
 脚本会从 ARN 自动解析出 region 与日志组名，无需另填区域。
 
 > `config.env` 含 AWS 账号 ID 与日志组 ARN，已加入 `.gitignore` 不会被提交；请勿把它推送到代码仓库。
+
+## 可选：Amazon Connect 补充数据与 CSAT 满意度评分
+
+页面部分列（通话智能摘要、挂断方、CSAT 满意度评分、接电话的 DID 等）无法从 CloudWatch AI Agent 日志里获取，需要额外调用 Amazon Connect API 补充：
+
+- **本地预览版**：由 [`lib/fetch-connect-contact-details.py`](./lib/fetch-connect-contact-details.py) 调 `describe-contact` / `get-contact-attributes`，为每个 Contact 生成 `connect-enrich.js` 供前端消费；缺失字段显示 N/A。
+- **CloudFront 版**：登录后由浏览器用临时凭证实时调 `DescribeContact` 补齐。
+
+其中 **CSAT 满意度评分** 取自 Amazon Connect 联系人属性（Contact Attributes）里的某个自定义键。不同账号 / Contact Flow 写入的键名可能不同，因此**键名不写死，可通过配置指定**：
+
+- 配置项为 `config.env` 里的 `CSAT_ATTRIBUTE_KEY`；**不配置时默认取 `botevaluation`**。
+- 键名解析优先级（后端脚本）：`--csat-attr` 参数 > 环境变量 `CSAT_ATTRIBUTE_KEY` > `config.env` 里的 `CSAT_ATTRIBUTE_KEY` > 默认值 `botevaluation`。
+- 要让该列真正有值，需在 Contact Flow 里把满意度调查结果写入该联系人属性。
+
+生成本地补充数据示例：
+
+```bash
+python3 lib/fetch-connect-contact-details.py \
+  --instance-id <connect-instance-id> --region us-east-1 \
+  --data-js dist/data.js --out dist/connect-enrich.js
+# 用非默认属性键名(例如 surveyResult)时:
+python3 lib/fetch-connect-contact-details.py \
+  --instance-id <connect-instance-id> --region us-east-1 \
+  --data-js dist/data.js --out dist/connect-enrich.js \
+  --csat-attr surveyResult
+```
 
 ## 用法
 
@@ -445,6 +475,7 @@ chmod +x setup-connect-ai-agent-logs-analysis-in-cloudfront.sh
 | `--hours <n>` | 仅拉取最近 n 小时；0 = 全部历史 | `0` |
 | `--profile <p>` | AWS CLI profile | 默认凭证 |
 | `--out-dir <dir>` | 本地构建目录 | `./dist-cloudfront` |
+| `--csat-attr <key>` | CSAT 满意度评分对应的联系人属性键名（注入前端供浏览器实时读取）| `botevaluation` |
 
 ## 登录流程
 

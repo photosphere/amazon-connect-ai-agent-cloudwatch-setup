@@ -41,6 +41,7 @@
 #   --out-dir <dir>      放临时部署产物的目录; 默认系统临时目录(/tmp)
 #   --keep               保留临时产物目录(默认结束后自动清理)
 #   --lambda-memory <MB> 解析 Lambda 内存; 默认 3008; 日志量大时调大(如 8192/10240)
+#   --csat-attr <key>    CSAT 满意度评分对应的联系人属性键名; 默认 botevaluation
 #   -h, --help           显示帮助
 #
 # 依赖: aws cli v2(已配置凭证)、python3。
@@ -72,6 +73,10 @@ KEEP="false"
 # 日志量很大(如 >100MB)时可调大，例如 --lambda-memory 6144 / 8192 / 10240。
 LAMBDA_MEMORY="3008"
 
+# 「CSAT 满意度评分」列对应的 Amazon Connect 联系人属性键名(不写死)。
+# 可用 --csat-attr 覆盖，或用环境变量 CSAT_ATTRIBUTE_KEY;默认 botevaluation。
+CSAT_ATTRIBUTE_KEY="${CSAT_ATTRIBUTE_KEY:-botevaluation}"
+
 # CloudFront 托管缓存策略 CachingOptimized 的固定 ID
 CF_CACHE_POLICY_ID="658327ea-f89d-4fab-a63d-7e88639e58f6"
 # 浏览器版 AWS SDK v2
@@ -95,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --out-dir)     OUT_DIR="$2"; shift 2;;
     --keep)        KEEP="true"; shift;;
     --lambda-memory) LAMBDA_MEMORY="$2"; shift 2;;
+    --csat-attr)   CSAT_ATTRIBUTE_KEY="$2"; shift 2;;
     -h|--help)     usage; exit 0;;
     *) echo "未知参数: $1" >&2; usage; exit 1;;
   esac
@@ -717,7 +723,8 @@ window.__AWS_CONFIG__ = {
   logsPrefix: "",
   connectInstanceId: "${CONNECT_INSTANCE_ID}",
   connectInstanceArn: "${CONNECT_INSTANCE_ARN}",
-  connectRegion: "${CONNECT_INSTANCE_REGION}"
+  connectRegion: "${CONNECT_INSTANCE_REGION}",
+  csatAttribute: "${CSAT_ATTRIBUTE_KEY}"
 };
 JSCFG
 
