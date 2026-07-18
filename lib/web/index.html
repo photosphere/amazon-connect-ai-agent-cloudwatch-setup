@@ -280,7 +280,21 @@
   .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
   .contact-table { width: 100%; border-collapse: collapse; background: var(--panel); }
   .contact-table th, .contact-table td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; white-space: nowrap; vertical-align: top; }
-  .contact-table td.summary-cell { white-space: normal; min-width: 200px; max-width: 320px; }
+  /* 通话摘要列: 宽度较原来加宽 60% (min 200->320, max 320->512) */
+  .contact-table td.summary-cell { white-space: normal; min-width: 320px; max-width: 512px; }
+  /* 折叠态: 最多显示 3 行, 溢出隐藏; 展开态显示全部 */
+  .contact-table td.summary-cell .summary-text {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+    overflow: hidden; word-break: break-word;
+  }
+  .contact-table td.summary-cell.expanded .summary-text {
+    display: block; -webkit-line-clamp: unset; overflow: visible;
+  }
+  .summary-toggle {
+    margin-top: 4px; padding: 0; background: none; border: none;
+    color: var(--accent); font-size: 11px; cursor: pointer;
+  }
+  .summary-toggle:hover { text-decoration: underline; }
   .contact-table td.reason-cell { white-space: normal; min-width: 160px; max-width: 260px; }
   .contact-table td.na { color: var(--muted); }
   .num-good { color: var(--green); }
