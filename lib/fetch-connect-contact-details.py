@@ -17,8 +17,11 @@ fetch-connect-contact-details.py
   }
 
 数据来源(均通过 aws CLI, 需已配置凭证且有相应权限):
-  - aws connect describe-contact        -> DisconnectReason / SystemEndpoint(DID) / Attributes / 摘要(若开启)
+  - aws connect describe-contact        -> DisconnectReason / SystemEndpoint(DID) / Attributes / 录音在 S3 的位置
   - aws connect get-contact-attributes  -> 联系人属性(CSAT / BU / 摘要等自定义键)
+  - aws s3 (list-objects-v2 / cp)       -> 读取与录音同桶的分析结果 JSON, 取生成式
+                                            "自动交互摘要"(ContactSummary.AutomatedInteractionSummary)
+    需要额外的 S3 权限: s3:ListBucket / s3:GetObject(录音/分析结果所在桶)
 
 CSAT(满意度评分)取自联系人属性里的某个自定义键, 键名不写死, 由配置决定:
   优先级: --csat-attr 参数 > 环境变量 CSAT_ATTRIBUTE_KEY > config.env 里的 CSAT_ATTRIBUTE_KEY
@@ -34,9 +37,12 @@ Contact ID 来源(二选一):
       --data-js dist/data.js --out dist/connect-enrich.js
 
 说明:
-  - 摘要 API 在不同账号/版本上差异较大: 脚本会依次尝试 describe-contact 返回体里的
-    摘要字段, 以及联系人属性里的 contactSummary / summary 自定义键。都取不到则留空,
-    前端显示 N/A。
+  - 摘要(通话/自动交互智能摘要)不在 describe-contact 返回体里, 而在与录音同桶的分析结果
+    JSON(路径把 .../CallRecordings/<sub>/<date>/ 映射为 Analysis/Voice(或 Chat)/<sub>/<date>/,
+    文件名形如 <contactId>_analysis_*.json)的
+    ConversationCharacteristics.ContactSummary.AutomatedInteractionSummary.Content 里。
+    脚本优先从该分析结果 JSON 取摘要, 取不到再回退 describe-contact 返回体字段及联系人
+    属性里的 contactSummary / summary 自定义键。都取不到则留空, 前端显示 N/A。
   - 任何单个 Contact 拉取失败都不会中断整体, 仅记录并跳过该字段。
 """
 import argparse
@@ -80,21 +86,41 @@ def resolve_csat_key(cli_value, config_path):
     )
 
 
-def aws_connect(subcommand, args, region):
-    """执行 aws connect <subcommand> ... 并返回解析后的 JSON;失败返回 None。"""
-    cmd = ["aws", "connect", subcommand, "--region", region, "--output", "json"] + args
+def aws_cli(service, subcommand, args, region):
+    """执行 aws <service> <subcommand> ... --output json 并返回解析后的 JSON;失败返回 None。"""
+    cmd = ["aws", service, subcommand, "--region", region, "--output", "json"] + args
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except FileNotFoundError:
         sys.stderr.write("错误: 未找到 aws CLI。\n")
         sys.exit(2)
     except subprocess.CalledProcessError as e:
-        sys.stderr.write("  [%s] 调用失败: %s\n" % (subcommand, (e.stderr or "").strip()[:300]))
+        sys.stderr.write("  [%s %s] 调用失败: %s\n"
+                         % (service, subcommand, (e.stderr or "").strip()[:300]))
         return None
     try:
         return json.loads(res.stdout or "{}")
     except ValueError:
         return None
+
+
+def aws_connect(subcommand, args, region):
+    """执行 aws connect <subcommand> ... 并返回解析后的 JSON;失败返回 None。"""
+    return aws_cli("connect", subcommand, args, region)
+
+
+def s3_get_text(bucket, key, region):
+    """把 s3://bucket/key 的内容读为文本;失败返回 None。"""
+    cmd = ["aws", "s3", "cp", "s3://%s/%s" % (bucket, key), "-", "--region", region]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        sys.stderr.write("错误: 未找到 aws CLI。\n")
+        sys.exit(2)
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write("  [s3 cp %s] 调用失败: %s\n" % (key, (e.stderr or "").strip()[:300]))
+        return None
+    return res.stdout
 
 
 def extract_contact_ids_from_data_js(path):
@@ -121,6 +147,74 @@ def extract_contact_ids_from_data_js(path):
             seen.add(cid)
             ids.append(cid)
     return ids
+
+
+def analysis_key_prefix(contact):
+    """由 describe-contact 的 Recordings 位置推断分析结果 JSON 在 S3 的 (bucket, keyPrefix)。
+
+    describe-contact 不直接返回摘要, 但会返回录音/记录在 S3 的位置, 例如:
+        <bucket>/connect/<alias>/CallRecordings/ivr/2026/07/17/<cid>_<ts>_UTC.wav
+    生成式"自动交互摘要"分析结果与录音同桶, 路径把
+        .../CallRecordings/<sub>/<date>/   映射为   Analysis/Voice/<sub>/<date>/
+    (聊天则为 ChatTranscripts/ -> Analysis/Chat/), 文件名形如
+        <contactId>_analysis_<timestamp>.json
+    返回 (bucket, prefix) 或 (None, None)。
+    """
+    recs = contact.get("Recordings") or []
+    channel = (contact.get("Channel") or "VOICE").upper()
+    analysis_root = "Analysis/Chat" if channel == "CHAT" else "Analysis/Voice"
+
+    def rel_dir(loc, marker):
+        # loc: <bucket>/.../<marker><sub>/<date>/<file>; 返回 (bucket, "<sub>/<date>")
+        bucket, _, rest = loc.partition("/")
+        if marker not in rest:
+            return None, None
+        sub = rest.split(marker, 1)[1]      # ivr/2026/07/17/<file>.wav
+        if "/" not in sub:
+            return None, None
+        return bucket, sub.rsplit("/", 1)[0]  # ivr/2026/07/17
+
+    # 优先用音频/文字记录(排除 AUTOMATED_INTERACTION_LOG 等辅助流)推断目录
+    candidates = []
+    for r in recs:
+        if isinstance(r, dict) and r.get("StorageType") == "S3" and r.get("Location"):
+            mst = r.get("MediaStreamType") or ""
+            score = 0 if mst in ("AUDIO", "CHAT", "") else 1  # 辅助流排后面
+            candidates.append((score, r["Location"]))
+    candidates.sort(key=lambda x: x[0])
+
+    for marker in ("CallRecordings/", "ChatTranscripts/"):
+        for _, loc in candidates:
+            bucket, subdir = rel_dir(loc, marker)
+            if bucket and subdir:
+                cid = contact.get("Id") or ""
+                return bucket, "%s/%s/%s_analysis_" % (analysis_root, subdir, cid)
+    return None, None
+
+
+def fetch_analysis_summary(contact, region):
+    """从 S3 分析结果 JSON 里取生成式"自动交互摘要"(AutomatedInteractionSummary)。取不到返回 ""。"""
+    bucket, prefix = analysis_key_prefix(contact)
+    if not bucket or not prefix:
+        return ""
+    lo = aws_cli("s3api", "list-objects-v2",
+                 ["--bucket", bucket, "--prefix", prefix], region)
+    keys = [c.get("Key") for c in (lo or {}).get("Contents", []) if c.get("Key")]
+    if not keys:
+        return ""
+    # 文件名带时间戳, 可排序; 取最新的一个
+    body = s3_get_text(bucket, sorted(keys)[-1], region)
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return ""
+    cc = data.get("ConversationCharacteristics") or {}
+    cs = cc.get("ContactSummary") or {}
+    ais = cs.get("AutomatedInteractionSummary") or {}
+    content = ais.get("Content")
+    return content.strip() if isinstance(content, str) and content.strip() else ""
 
 
 def pick_summary(contact, attrs):
@@ -177,7 +271,8 @@ def fetch_one(instance_id, region, contact_id, csat_key):
     attrs.update(ga_attrs)
 
     disconnect = contact.get("DisconnectReason") or attrs.get("disconnectReason") or ""
-    summary = pick_summary(contact, attrs)
+    # 摘要优先取 S3 分析结果里的生成式"自动交互摘要", 取不到再回退到属性/返回体字段
+    summary = fetch_analysis_summary(contact, region) or pick_summary(contact, attrs)
     did = pick_did(contact) or attrs.get("did", "")
     # CSAT: 用配置的键名取值; 未取到时保持回退 csat 键以兼容旧数据。
     survey = attrs.get(csat_key, attrs.get("csat", ""))
