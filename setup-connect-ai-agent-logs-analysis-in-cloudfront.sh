@@ -162,6 +162,23 @@ fi
 CONNECT_INSTANCE_REGION="$(echo "${CONNECT_INSTANCE_ARN}" | cut -d: -f4)"
 CONNECT_INSTANCE_ID="${CONNECT_INSTANCE_ARN##*/}"
 
+# 通话/自动交互智能摘要不在 DescribeContact 返回体里, 而在与通话录音同桶的分析结果 JSON
+# (Analysis/Voice|Chat/.../<contactId>_analysis_*.json)里。这里查出实例配置的通话录音
+# 存储桶名, 供前端(浏览器用 Cognito 临时凭证)读取分析结果, 并据此授予只读 S3 权限。
+# 查不到则留空: 摘要列在 CloudFront 版将回退显示 N/A(不影响其它功能)。
+RECORDINGS_BUCKET="$(awscli connect list-instance-storage-configs \
+  --instance-id "${CONNECT_INSTANCE_ID}" \
+  --resource-type CALL_RECORDINGS \
+  --region "${CONNECT_INSTANCE_REGION}" \
+  --query 'StorageConfigs[0].S3Config.BucketName' \
+  --output text 2>/dev/null || true)"
+if [[ "${RECORDINGS_BUCKET}" == "None" ]]; then RECORDINGS_BUCKET=""; fi
+if [[ -n "${RECORDINGS_BUCKET}" ]]; then
+  echo "==> 通话录音/分析结果存储桶: ${RECORDINGS_BUCKET}(用于读取自动交互摘要)"
+else
+  echo "==> 未能解析通话录音存储桶; CloudFront 版的「通话摘要」列将显示 N/A。" >&2
+fi
+
 if [[ -z "${EMAIL}" ]]; then
   echo "请输入登录用户邮箱(将接收一次性密码，必选):"
   printf "EMAIL: "
@@ -314,6 +331,48 @@ cat > "${CORS_JSON}" <<'JSON'
 JSON
 echo "==> 配置日志桶 CORS ..."
 awscli s3api put-bucket-cors --bucket "${LOGS_BUCKET}" --cors-configuration "file://${CORS_JSON}" >/dev/null
+
+# 录音/分析结果桶(Connect 托管)也需允许浏览器跨域 GET, 以便前端读取自动交互摘要。
+# 该桶可能是共享资源, 这里"合并"而非覆盖: 保留已有 CORS 规则, 仅在缺少可用 GET 规则时追加。
+if [[ -n "${RECORDINGS_BUCKET}" ]]; then
+  echo "==> 合并录音/分析结果桶 CORS(用于读取自动交互摘要): ${RECORDINGS_BUCKET}"
+  EXISTING_CORS="$(awscli s3api get-bucket-cors --bucket "${RECORDINGS_BUCKET}" --output json 2>/dev/null || echo '{}')"
+  MERGED_CORS_JSON="${WORK}/_rec_cors.json"
+  if EXISTING_CORS="${EXISTING_CORS}" python3 - "${MERGED_CORS_JSON}" <<'PYEOF'
+import json, os, sys
+existing = {}
+try:
+    existing = json.loads(os.environ.get("EXISTING_CORS") or "{}")
+except ValueError:
+    existing = {}
+rules = existing.get("CORSRules") or []
+# 是否已有允许 GET 且来源包含 * 的规则
+def allows_get_star(r):
+    methods = r.get("AllowedMethods") or []
+    origins = r.get("AllowedOrigins") or []
+    return "GET" in methods and "*" in origins
+if not any(allows_get_star(r) for r in rules):
+    rules.append({
+        "AllowedOrigins": ["*"],
+        "AllowedMethods": ["GET", "HEAD"],
+        "AllowedHeaders": ["*"],
+        "ExposeHeaders": ["ETag"],
+        "MaxAgeSeconds": 3000,
+    })
+    with open(sys.argv[1], "w", encoding="utf-8") as f:
+        json.dump({"CORSRules": rules}, f)
+    sys.exit(0)
+sys.exit(3)  # 已有可用规则, 无需改动
+PYEOF
+  then
+    awscli s3api put-bucket-cors --bucket "${RECORDINGS_BUCKET}" \
+      --cors-configuration "file://${MERGED_CORS_JSON}" >/dev/null \
+      && echo "    已追加 GET/HEAD CORS 规则。" \
+      || echo "    警告: 写入录音桶 CORS 失败(可能无权限); 摘要列可能显示 N/A。" >&2
+  else
+    echo "    录音桶已有可用的 GET CORS 规则, 保持不变。"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 2b. 解析用 Lambda: 执行角色 + 部署包 + 函数 + S3 触发权限 + 桶事件通知
@@ -608,6 +667,22 @@ cat > "${TRUST_JSON}" <<JSON
 JSON
 
 S3_POLICY_JSON="${WORK}/_s3policy.json"
+# 通话录音/分析结果桶的只读语句(用于读取自动交互摘要); 仅在解析到桶名时追加。
+# GetObject 限定在 Analysis/ 前缀(摘要分析结果), ListBucket 用于按前缀列出对应文件。
+REC_STMT=""
+if [[ -n "${RECORDINGS_BUCKET}" ]]; then
+  REC_STMT=",
+    {
+      \"Effect\": \"Allow\",
+      \"Action\": [\"s3:GetObject\"],
+      \"Resource\": \"arn:aws:s3:::${RECORDINGS_BUCKET}/Analysis/*\"
+    },
+    {
+      \"Effect\": \"Allow\",
+      \"Action\": [\"s3:ListBucket\"],
+      \"Resource\": \"arn:aws:s3:::${RECORDINGS_BUCKET}\"
+    }"
+fi
 cat > "${S3_POLICY_JSON}" <<JSON
 {
   "Version": "2012-10-17",
@@ -621,7 +696,7 @@ cat > "${S3_POLICY_JSON}" <<JSON
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
       "Resource": "arn:aws:s3:::${LOGS_BUCKET}"
-    }
+    }${REC_STMT}
   ]
 }
 JSON
@@ -724,6 +799,7 @@ window.__AWS_CONFIG__ = {
   connectInstanceId: "${CONNECT_INSTANCE_ID}",
   connectInstanceArn: "${CONNECT_INSTANCE_ARN}",
   connectRegion: "${CONNECT_INSTANCE_REGION}",
+  recordingsBucket: "${RECORDINGS_BUCKET}",
   csatAttribute: "${CSAT_ATTRIBUTE_KEY}"
 };
 JSCFG

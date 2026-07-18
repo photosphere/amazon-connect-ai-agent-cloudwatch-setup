@@ -221,6 +221,10 @@ CSAT_ATTRIBUTE_KEY="botevaluation"
 - **本地预览版**：由 [`lib/fetch-connect-contact-details.py`](./lib/fetch-connect-contact-details.py) 调 `describe-contact` / `get-contact-attributes`，为每个 Contact 生成 `connect-enrich.js` 供前端消费；缺失字段显示 N/A。
 - **CloudFront 版**：登录后由浏览器用临时凭证实时调 `DescribeContact` 补齐。
 
+> **关于「通话摘要」（生成式自动交互摘要）**：该摘要**不在** `DescribeContact` 返回体里，而在与通话录音**同一个 S3 桶**的分析结果 JSON 中，路径把 `.../CallRecordings/<sub>/<date>/` 映射为 `Analysis/Voice`（聊天为 `Analysis/Chat`）`/<sub>/<date>/`，文件名形如 `<contactId>_analysis_*.json`，取其 `ConversationCharacteristics.ContactSummary.AutomatedInteractionSummary.Content`。
+> - 本地预览版：`fetch-connect-contact-details.py` 会先从 `DescribeContact` 拿到录音位置，再读取该分析结果 JSON 补全摘要（需要对录音桶的 `s3:ListBucket` / `s3:GetObject` 权限）。
+> - CloudFront 版：部署脚本会自动用 `list-instance-storage-configs` 解析出录音桶名，注入前端并给登录角色授予该桶 `Analysis/*` 的只读权限；浏览器登录后即可读取并显示摘要。若解析不到录音桶，摘要列回退显示 N/A。
+
 其中 **CSAT 满意度评分** 取自 Amazon Connect 联系人属性（Contact Attributes）里的某个自定义键。不同账号 / Contact Flow 写入的键名可能不同，因此**键名不写死，可通过配置指定**：
 
 - 配置项为 `config.env` 里的 `CSAT_ATTRIBUTE_KEY`；**不配置时默认取 `botevaluation`**。
